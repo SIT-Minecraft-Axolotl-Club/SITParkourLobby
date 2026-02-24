@@ -1,0 +1,35 @@
+﻿name: SITParkourLobby
+version: '1.0'
+main: club.sitmc.sitParkourLobby.SITParkourLobby
+api-version: '1.21'
+prefix: SITMCPK
+load: STARTUP
+authors: [ 上应天子Minecraft社 ]
+description: SIT 跑酷大厅
+website: www.sitmc.club
+commands:
+  lobby:
+    description: 传送到大厅世界出生点。
+    usage: /lobby
+  hub:
+    description: 传送到大厅世界出生点。
+    usage: /hub
+  spawn:
+    description: 传送到大厅世界出生点。
+    usage: /spawn
+  map:
+    description: 传送到指定世界出生点。
+    usage: /map <世界名>
+  create:
+    description: 创建一个虚空世界。
+    usage: /create <世界名>
+  falldamage:
+    description: 切换当前世界摔落伤害。
+    usage: /falldamage [on|off|toggle]
+permissions:
+  sitpk.create:
+    description: 允许创建虚空世界。
+    default: op
+  sitpk.falldamage:
+    description: 允许切换摔落伤害。
+    default: op
