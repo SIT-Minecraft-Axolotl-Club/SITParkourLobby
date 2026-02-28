@@ -20,6 +20,15 @@ commands:
   map:
     description: 传送到指定世界出生点。
     usage: /map <世界名>
+  addmap:
+    description: 添加可用的 /map 世界。
+    usage: /addmap <世界名>
+  delmap:
+    description: 从 /map 列表移除世界。
+    usage: /delmap <世界名>
+  listmap:
+    description: 查看可用的 /map 世界列表。
+    usage: /listmap
   create:
     description: 创建一个虚空世界。
     usage: /create <世界名>
@@ -32,4 +41,7 @@ permissions:
     default: op
   sitpk.falldamage:
     description: 允许切换摔落伤害。
+    default: op
+  sitpk.addmap:
+    description: 允许添加 /map 可用世界并查看全部世界。
     default: op
