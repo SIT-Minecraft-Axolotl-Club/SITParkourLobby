@@ -19,10 +19,13 @@ import org.bukkit.configuration.file.YamlConfiguration;
 import org.bukkit.entity.Player;
 import org.bukkit.event.EventHandler;
 import org.bukkit.event.Listener;
+import org.bukkit.event.entity.EntityPortalEvent;
 import org.bukkit.event.player.PlayerChangedWorldEvent;
+import org.bukkit.event.player.PlayerPortalEvent;
 import org.bukkit.event.player.PlayerJoinEvent;
 import org.bukkit.event.player.PlayerMoveEvent;
 import org.bukkit.event.player.PlayerQuitEvent;
+import org.bukkit.event.player.PlayerRespawnEvent;
 import org.bukkit.event.server.ServerLoadEvent;
 import org.bukkit.event.world.WorldLoadEvent;
 import org.bukkit.generator.BiomeProvider;
@@ -35,6 +38,9 @@ import org.bukkit.scoreboard.Scoreboard;
 import org.bukkit.scoreboard.ScoreboardManager;
 import org.bukkit.scoreboard.Team;
 
+import club.sitmc.sitParkourLobby.event.ManagedWorldsLoadedEvent;
+import club.sitmc.sitParkourLobby.inventory.InventoryListener;
+import club.sitmc.sitParkourLobby.inventory.InventoryManager;
 import java.io.File;
 import java.text.DecimalFormat;
 import java.text.DecimalFormatSymbols;
@@ -49,11 +55,13 @@ import java.util.UUID;
 public final class SITParkourLobby extends JavaPlugin implements CommandExecutor, TabCompleter, Listener {
 
     private boolean ranStartupReload = false;
+    private boolean startupWorldsLoaded = false;
     private static final String MESSAGE_PREFIX = "&3&lSIT-Parkour &8| &f";
     private static final String NO_COLLISION_TEAM_NAME = "no_collision";
     private static final LegacyComponentSerializer LEGACY = LegacyComponentSerializer.legacyAmpersand();
     private static final String DATA_FILE_NAME = "data.yml";
     private static final String MAPS_DATA_PATH = "maps";
+    private static final String MANAGED_WORLDS_DATA_PATH = "managed-worlds";
     private static final String SCOREBOARD_TITLE = "&3&lSIT-Minecraft";
     private static final List<String> SCOREBOARD_TEMPLATE = List.of(
             "&b=====================",
@@ -74,16 +82,22 @@ public final class SITParkourLobby extends JavaPlugin implements CommandExecutor
     private final Map<UUID, Scoreboard> playerBoards = new HashMap<>();
     private final DecimalFormat hoursFormat = new DecimalFormat("0.0", DecimalFormatSymbols.getInstance(Locale.US));
     private final Set<String> allowedMaps = new HashSet<>();
+    private final Set<String> managedWorlds = new HashSet<>();
     private YamlConfiguration dataConfig;
     private File dataFile;
     private int scoreboardTaskId = -1;
     private int settingsTaskId = -1;
+    private InventoryManager inventoryManager;
 
     @Override
     public void onEnable() {
         saveDefaultConfig();
         loadDataFile();
         loadAllowedMaps();
+        loadManagedWorlds();
+
+        // 受管世界不在 onEnable 中加载（STARTUP 阶段禁止创建世界）
+        // 改为在 ServerLoadEvent 触发后加载，见 onServerLoad + loadAllManagedWorlds
 
         registerCommand("lobby");
         registerCommand("hub");
@@ -94,12 +108,17 @@ public final class SITParkourLobby extends JavaPlugin implements CommandExecutor
         registerCommand("listmap");
         registerCommand("create");
         registerCommand("falldamage");
+        registerCommand("world");
 
         if (getCommand("map") != null) {
             getCommand("map").setTabCompleter(this);
         }
 
         Bukkit.getPluginManager().registerEvents(this, this);
+
+        // 按世界独立背包
+        inventoryManager = new InventoryManager(getDataFolder(), getLogger());
+        Bukkit.getPluginManager().registerEvents(new InventoryListener(inventoryManager, getLogger()), this);
 
         Bukkit.setDefaultGameMode(GameMode.ADVENTURE);
         for (World world : Bukkit.getWorlds()) {
@@ -116,6 +135,10 @@ public final class SITParkourLobby extends JavaPlugin implements CommandExecutor
         startScoreboardTask();
         startSettingsTask();
         Bukkit.getScheduler().runTask(this, this::initializeNoCollisionTeam);
+
+        // 兜底：若 ServerLoadEvent 因某些原因未触发，runTask 延迟 1 tick 后也尝试加载
+        // 与 ServerLoadEvent 共享 startupWorldsLoaded 标志位，确保只执行一次
+        Bukkit.getScheduler().runTask(this, this::loadAllManagedWorlds);
     }
 
     @Override
@@ -255,6 +278,11 @@ public final class SITParkourLobby extends JavaPlugin implements CommandExecutor
             send(sender, "可用地图: " + String.join(", ", maps));
             return true;
         }
+
+        if (name.equals("world")) {
+            return handleWorldCommand(sender, args);
+        }
+
         if (!(sender instanceof Player player)) {
             send(sender, "只有玩家可以使用该命令。");
             return true;
@@ -359,17 +387,26 @@ public final class SITParkourLobby extends JavaPlugin implements CommandExecutor
                     .toList();
         }
 
+        if (name.equals("world")) {
+            return tabCompleteWorld(sender, args);
+        }
+
         return List.of();
     }
 
     @EventHandler
     public void onServerLoad(ServerLoadEvent event) {
-        if (ranStartupReload || event.getType() != ServerLoadEvent.LoadType.STARTUP) {
+        if (event.getType() != ServerLoadEvent.LoadType.STARTUP) {
             return;
         }
-        ranStartupReload = true;
-        Bukkit.dispatchCommand(Bukkit.getConsoleSender(), "sitpk reload");
-        initializeNoCollisionTeam();
+
+        if (!ranStartupReload) {
+            ranStartupReload = true;
+            initializeNoCollisionTeam();
+        }
+
+        // 服务器已完全启动，此时可以安全创建/加载世界
+        loadAllManagedWorlds();
     }
 
     @EventHandler
@@ -397,6 +434,42 @@ public final class SITParkourLobby extends JavaPlugin implements CommandExecutor
         savePlayerStats(player.getUniqueId());
         playerBoards.remove(player.getUniqueId());
         lastOnGround.remove(player.getUniqueId());
+    }
+
+    /**
+     * 死亡重生：去掉 Multiverse 后，原版会将玩家重生到主世界出生点。
+     * 此处理器恢复 MV 的行为——非床/锚重生时，将重生位置设为
+     * 玩家死亡所在世界的出生点。
+     */
+    @EventHandler
+    public void onPlayerRespawn(PlayerRespawnEvent event) {
+        // 床重生或重生锚重生 → 尊重玩家设置
+        if (event.isBedSpawn() || event.isAnchorSpawn()) {
+            return;
+        }
+
+        // 非床/锚重生 → 使用死亡时所在世界的出生点
+        Player player = event.getPlayer();
+        World deathWorld = player.getWorld();
+        event.setRespawnLocation(deathWorld.getSpawnLocation());
+    }
+
+    /**
+     * 禁用玩家通过下界门/末地门的传送。
+     * 本服为跑酷/大厅服，不需要下界和末地。
+     */
+    @EventHandler
+    public void onPlayerPortal(PlayerPortalEvent event) {
+        event.setCancelled(true);
+    }
+
+    /**
+     * 禁用实体（物品/生物等）通过传送门的传送，
+     * 避免实体把传送门"用起来"。
+     */
+    @EventHandler
+    public void onEntityPortal(EntityPortalEvent event) {
+        event.setCancelled(true);
     }
 
     @EventHandler
@@ -485,6 +558,21 @@ public final class SITParkourLobby extends JavaPlugin implements CommandExecutor
         }
         player.setCollidable(false);
         noCollisionTeam.addEntry(player.getName());
+
+        Scoreboard customBoard = playerBoards.get(player.getUniqueId());
+        if (customBoard != null) {
+            Team customTeam = ensureNoCollisionTeam(customBoard);
+            customTeam.addEntry(player.getName());
+        }
+    }
+
+    private Team ensureNoCollisionTeam(Scoreboard board) {
+        Team team = board.getTeam(NO_COLLISION_TEAM_NAME);
+        if (team == null) {
+            team = board.registerNewTeam(NO_COLLISION_TEAM_NAME);
+        }
+        team.setOption(Team.Option.COLLISION_RULE, Team.OptionStatus.NEVER);
+        return team;
     }
 
     private void applyPlayerEntryRules(Player player) {
@@ -557,6 +645,7 @@ public final class SITParkourLobby extends JavaPlugin implements CommandExecutor
             dataConfig.set(base + ".playtimeSeconds", entry.getValue().playtimeSeconds);
         }
         dataConfig.set(MAPS_DATA_PATH, allowedMaps.stream().sorted().toList());
+        dataConfig.set(MANAGED_WORLDS_DATA_PATH, managedWorlds.stream().sorted().toList());
         try {
             dataConfig.save(dataFile);
         } catch (Exception ignored) {
@@ -602,6 +691,10 @@ public final class SITParkourLobby extends JavaPlugin implements CommandExecutor
         objective.setDisplayName(ChatColor.translateAlternateColorCodes('&', SCOREBOARD_TITLE));
         playerBoards.put(player.getUniqueId(), board);
         player.setScoreboard(board);
+
+        Team collisionTeam = ensureNoCollisionTeam(board);
+        collisionTeam.addEntry(player.getName());
+
         updateScoreboard(player, getOrCreateStats(player.getUniqueId()));
     }
 
@@ -661,6 +754,340 @@ public final class SITParkourLobby extends JavaPlugin implements CommandExecutor
     }
 
     private static final class VoidChunkGenerator extends ChunkGenerator {
+        @Override
+        public List<org.bukkit.generator.BlockPopulator> getDefaultPopulators(World world) {
+            return List.of();
+        }
+
+        @Override
+        public boolean shouldGenerateNoise() { return false; }
+
+        @Override
+        public boolean shouldGenerateSurface() { return false; }
+
+        @Override
+        public boolean shouldGenerateCaves() { return false; }
+
+        @Override
+        public boolean shouldGenerateDecorations() { return false; }
+
+        @Override
+        public boolean shouldGenerateMobs() { return false; }
+
+        @Override
+        public boolean shouldGenerateStructures() { return false; }
+    }
+
+    // ==================== 受管世界列表持久化 ====================
+
+    private void loadManagedWorlds() {
+        managedWorlds.clear();
+        managedWorlds.addAll(dataConfig.getStringList(MANAGED_WORLDS_DATA_PATH));
+    }
+
+    private void saveManagedWorlds() {
+        dataConfig.set(MANAGED_WORLDS_DATA_PATH, managedWorlds.stream().sorted().toList());
+        try {
+            dataConfig.save(dataFile);
+        } catch (Exception ignored) {
+        }
+    }
+
+    // ==================== 服务器就绪后加载受管世界 ====================
+
+    /**
+     * 在服务器完全启动后加载受管世界。
+     * 由 ServerLoadEvent (主) 和 onEnable 末尾的 runTask (兜底) 共同触发，
+     * startupWorldsLoaded 标志位确保无论谁先触发，都只执行一次。
+     */
+    private void loadAllManagedWorlds() {
+        if (startupWorldsLoaded) {
+            return;
+        }
+        startupWorldsLoaded = true;
+
+        if (!managedWorlds.isEmpty()) {
+            getLogger().info("正在加载 " + managedWorlds.size() + " 个受管世界...");
+            for (String worldName : managedWorlds) {
+                loadSingleManagedWorld(worldName);
+            }
+        }
+
+        // 所有受管世界加载完成，广播事件通知其他插件（如 SITSegment）
+        getLogger().info("所有受管世界加载完成，广播 ManagedWorldsLoadedEvent (受管世界数: " + managedWorlds.size() + ")");
+        Bukkit.getPluginManager().callEvent(new ManagedWorldsLoadedEvent(List.copyOf(managedWorlds)));
+    }
+
+    private void loadSingleManagedWorld(String worldName) {
+        if (Bukkit.getWorld(worldName) != null) {
+            getLogger().info("受管世界已加载，跳过: " + worldName);
+            return;
+        }
+        try {
+            WorldCreator creator = new WorldCreator(worldName);
+            creator.generator(new VoidChunkGenerator());
+            creator.biomeProvider(new VoidBiomeProvider());
+            World world = creator.createWorld();
+            if (world == null) {
+                getLogger().warning("加载受管世界失败 (createWorld 返回 null): " + worldName);
+            } else {
+                // applyWorldSettings 会由 WorldLoadEvent 触发，此处显式调用确保覆盖
+                applyWorldSettings(world);
+                getLogger().info("已加载受管世界: " + worldName);
+            }
+        } catch (Exception e) {
+            getLogger().warning("加载受管世界异常: " + worldName + " — " + e.getMessage());
+        }
+    }
+
+    // ==================== /world 命令处理 ====================
+
+    private boolean handleWorldCommand(CommandSender sender, String[] args) {
+        if (!sender.hasPermission("sitpk.world")) {
+            send(sender, "你没有权限使用该命令。");
+            return true;
+        }
+
+        if (args.length == 0) {
+            send(sender, "用法: /world <import|add|remove|tp|list> [世界名]");
+            return true;
+        }
+
+        String sub = args[0].toLowerCase(Locale.ROOT);
+
+        switch (sub) {
+            case "import":
+                return handleWorldImport(sender, args);
+            case "add":
+                return handleWorldAdd(sender, args);
+            case "remove":
+                return handleWorldRemove(sender, args);
+            case "tp":
+                return handleWorldTp(sender, args);
+            case "list":
+                return handleWorldList(sender);
+            default:
+                send(sender, "未知子命令: " + sub + "。可用: import, add, remove, tp, list");
+                return true;
+        }
+    }
+
+    private boolean handleWorldImport(CommandSender sender, String[] args) {
+        if (args.length != 2) {
+            send(sender, "用法: /world import <世界名>");
+            return true;
+        }
+
+        String worldName = args[1];
+
+        // 检查世界文件夹是否存在
+        File worldFolder = new File(Bukkit.getWorldContainer(), worldName);
+        if (!worldFolder.exists() || !worldFolder.isDirectory()) {
+            send(sender, "世界文件夹不存在: " + worldName + " (路径: " + worldFolder.getAbsolutePath() + ")");
+            return true;
+        }
+
+        // 如果已在受管列表中
+        if (managedWorlds.contains(worldName)) {
+            send(sender, "该世界已在受管列表中: " + worldName);
+            return true;
+        }
+
+        // 如果未加载，加载它
+        if (Bukkit.getWorld(worldName) == null) {
+            try {
+                WorldCreator creator = new WorldCreator(worldName);
+                creator.generator(new VoidChunkGenerator());
+                creator.biomeProvider(new VoidBiomeProvider());
+                World world = creator.createWorld();
+                if (world == null) {
+                    send(sender, "导入失败，无法加载世界: " + worldName);
+                    return true;
+                }
+                applyWorldSettings(world);
+                getLogger().info("导入时加载世界: " + worldName);
+            } catch (Exception e) {
+                send(sender, "导入失败，加载异常: " + e.getMessage());
+                getLogger().warning("导入世界异常: " + worldName + " — " + e.getMessage());
+                return true;
+            }
+        }
+
+        managedWorlds.add(worldName);
+        saveManagedWorlds();
+        send(sender, "已导入并纳入受管列表: " + worldName);
+        return true;
+    }
+
+    private boolean handleWorldAdd(CommandSender sender, String[] args) {
+        if (args.length != 2) {
+            send(sender, "用法: /world add <世界名>");
+            return true;
+        }
+
+        String worldName = args[1];
+
+        if (Bukkit.getWorld(worldName) != null) {
+            send(sender, "世界已存在: " + worldName);
+            return true;
+        }
+
+        WorldCreator creator = new WorldCreator(worldName);
+        creator.generator(new VoidChunkGenerator());
+        creator.biomeProvider(new VoidBiomeProvider());
+        World created;
+        try {
+            created = creator.createWorld();
+        } catch (Exception e) {
+            send(sender, "创建世界失败: " + e.getMessage());
+            getLogger().warning("创建世界异常: " + worldName + " — " + e.getMessage());
+            return true;
+        }
+
+        if (created == null) {
+            send(sender, "创建世界失败: " + worldName);
+            return true;
+        }
+
+        applyWorldSettings(created);
+        placeSpawnBedrock(created);
+        managedWorlds.add(worldName);
+        saveManagedWorlds();
+        send(sender, "已创建虚空世界并纳入受管列表: " + worldName);
+        if (sender instanceof Player player) {
+            teleportToSpawn(player, created);
+        }
+        return true;
+    }
+
+    private boolean handleWorldRemove(CommandSender sender, String[] args) {
+        if (args.length != 2) {
+            send(sender, "用法: /world remove <世界名>");
+            return true;
+        }
+
+        String worldName = args[1];
+
+        if (!managedWorlds.contains(worldName)) {
+            send(sender, "该世界不在受管列表中: " + worldName);
+            return true;
+        }
+
+        World world = Bukkit.getWorld(worldName);
+        if (world != null) {
+            // 疏散玩家到大厅世界
+            World lobbyWorld = getLobbyWorld();
+            if (lobbyWorld != null && !lobbyWorld.equals(world)) {
+                for (Player player : world.getPlayers()) {
+                    send(player, "世界 " + worldName + " 正在被卸载，已将你传送回大厅。");
+                    player.teleport(lobbyWorld.getSpawnLocation());
+                }
+            }
+
+            // 卸载世界 (save=true 保存但不物理删除)
+            boolean unloaded = Bukkit.unloadWorld(world, true);
+            if (!unloaded) {
+                send(sender, "卸载世界失败: " + worldName);
+                return true;
+            }
+        }
+
+        managedWorlds.remove(worldName);
+        saveManagedWorlds();
+        send(sender, "已卸载并从受管列表移除: " + worldName + " (世界文件夹已保留)");
+        return true;
+    }
+
+    private boolean handleWorldTp(CommandSender sender, String[] args) {
+        if (!(sender instanceof Player player)) {
+            send(sender, "只有玩家可以使用该命令。");
+            return true;
+        }
+
+        if (args.length != 2) {
+            send(sender, "用法: /world tp <世界名>");
+            return true;
+        }
+
+        World targetWorld = Bukkit.getWorld(args[1]);
+        if (targetWorld == null) {
+            send(sender, "未找到世界: " + args[1]);
+            return true;
+        }
+
+        teleportToSpawn(player, targetWorld);
+        send(sender, "已传送到世界: " + targetWorld.getName());
+        return true;
+    }
+
+    private boolean handleWorldList(CommandSender sender) {
+        if (managedWorlds.isEmpty()) {
+            send(sender, "受管世界列表为空。");
+            return true;
+        }
+
+        List<String> list = managedWorlds.stream().sorted().map(worldName -> {
+            boolean loaded = Bukkit.getWorld(worldName) != null;
+            return (loaded ? "&a" : "&c") + worldName + (loaded ? "&f(已加载)" : "&f(未加载)");
+        }).toList();
+
+        send(sender, "受管世界(" + managedWorlds.size() + "): " + String.join("&7, ", list));
+        return true;
+    }
+
+    // ==================== /world Tab 补全 ====================
+
+    private List<String> tabCompleteWorld(CommandSender sender, String[] args) {
+        if (!sender.hasPermission("sitpk.world")) {
+            return List.of();
+        }
+
+        if (args.length == 1) {
+            String prefix = args[0].toLowerCase(Locale.ROOT);
+            return List.of("import", "add", "remove", "tp", "list").stream()
+                    .filter(sub -> sub.startsWith(prefix))
+                    .toList();
+        }
+
+        if (args.length == 2) {
+            String sub = args[0].toLowerCase(Locale.ROOT);
+            String prefix = args[1].toLowerCase(Locale.ROOT);
+            switch (sub) {
+                case "import":
+                    // 建议存在文件夹但未在受管列表中的世界
+                    File container = Bukkit.getWorldContainer();
+                    File[] dirs = container.listFiles(File::isDirectory);
+                    if (dirs == null) {
+                        return List.of();
+                    }
+                    return java.util.Arrays.stream(dirs)
+                            .map(File::getName)
+                            .filter(name -> !managedWorlds.contains(name))
+                            .filter(name -> name.toLowerCase(Locale.ROOT).startsWith(prefix))
+                            .sorted()
+                            .toList();
+
+                case "remove":
+                    // 建议受管列表中的世界
+                    return managedWorlds.stream()
+                            .filter(name -> name.toLowerCase(Locale.ROOT).startsWith(prefix))
+                            .sorted()
+                            .toList();
+
+                case "tp":
+                    // 建议已加载的世界
+                    return Bukkit.getWorlds().stream()
+                            .map(World::getName)
+                            .filter(name -> name.toLowerCase(Locale.ROOT).startsWith(prefix))
+                            .sorted()
+                            .toList();
+
+                default:
+                    return List.of();
+            }
+        }
+
+        return List.of();
     }
 
     private static final class VoidBiomeProvider extends BiomeProvider {

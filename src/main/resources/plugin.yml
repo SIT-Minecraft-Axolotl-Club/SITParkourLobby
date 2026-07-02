@@ -35,6 +35,9 @@ commands:
   falldamage:
     description: 切换当前世界摔落伤害。
     usage: /falldamage [on|off|toggle]
+  world:
+    description: 世界管理命令（导入/添加/移除/传送/列表）。
+    usage: /world <import|add|remove|tp|list> [世界名]
 permissions:
   sitpk.create:
     description: 允许创建虚空世界。
@@ -44,4 +47,7 @@ permissions:
     default: op
   sitpk.addmap:
     description: 允许添加 /map 可用世界并查看全部世界。
+    default: op
+  sitpk.world:
+    description: 允许使用 /world 世界管理命令。
     default: op
