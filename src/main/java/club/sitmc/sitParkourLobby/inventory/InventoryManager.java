@@ -17,7 +17,9 @@ import java.util.logging.Logger;
  * 按世界独立背包管理器。
  *
  * <p>以 玩家UUID + 世界名 为维度存储每个玩家在每个世界的物品栏快照，
- * 包括：主背包（36格，含快捷栏）、副手、盔甲栏（4格）。</p>
+ * 包括：主背包（36格，含快捷栏）、副手、盔甲栏（4格）。
+ * <b>slot 8（快捷栏最右格）为菜单时钟专属槽位，不参与持久化/反序列化，
+ * 始终由 MenuClockManager 接管。</b></p>
  *
  * <p>存储结构：</p>
  * <pre>
@@ -148,8 +150,10 @@ public class InventoryManager {
         int count = 0;
 
         // 主背包 36 格（0-8 快捷栏, 9-35 背包）
+        // slot 8 为菜单时钟专属槽位，不持久化（由 MenuClockManager 管理）
         ItemStack[] contents = inv.getContents();
         for (int i = 0; i < contents.length; i++) {
+            if (i == 8) continue;
             if (contents[i] != null && !contents[i].getType().isAir()) {
                 config.set(KEY_CONTENTS + "." + i, contents[i].serialize());
                 count++;
@@ -193,12 +197,13 @@ public class InventoryManager {
         inv.setArmorContents(new ItemStack[4]);
         inv.setItemInOffHand(null);
 
-        // 主背包（36 格）
+        // 主背包（36 格）—— slot 8 为菜单时钟专属槽位，不反序列化（由 MenuClockManager 管理）
         ConfigurationSection contentsSection = config.getConfigurationSection(KEY_CONTENTS);
         if (contentsSection != null) {
             Map<String, Object> contentsMap = contentsSection.getValues(false);
             ItemStack[] items = new ItemStack[36];
             for (int i = 0; i < 36; i++) {
+                if (i == 8) continue;
                 ItemStack restored = getSlotValue(contentsMap, i);
                 if (restored != null) {
                     items[i] = restored;

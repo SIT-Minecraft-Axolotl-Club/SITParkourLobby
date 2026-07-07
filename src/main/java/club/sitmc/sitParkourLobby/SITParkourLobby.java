@@ -15,6 +15,7 @@ import org.bukkit.command.Command;
 import org.bukkit.command.CommandExecutor;
 import org.bukkit.command.CommandSender;
 import org.bukkit.command.TabCompleter;
+import org.bukkit.configuration.ConfigurationSection;
 import org.bukkit.configuration.file.YamlConfiguration;
 import org.bukkit.entity.Player;
 import org.bukkit.event.EventHandler;
@@ -38,14 +39,26 @@ import org.bukkit.scoreboard.Scoreboard;
 import org.bukkit.scoreboard.ScoreboardManager;
 import org.bukkit.scoreboard.Team;
 
+import club.sitmc.sitParkourLobby.data.MapStatus;
+import club.sitmc.sitParkourLobby.data.ParkourDataProvider;
+import club.sitmc.sitParkourLobby.data.ParkourGameType;
+import club.sitmc.sitParkourLobby.data.SkinCacheManager;
+import club.sitmc.sitParkourLobby.data.TimingMode;
+import club.sitmc.sitParkourLobby.data.WorldMeta;
 import club.sitmc.sitParkourLobby.event.ManagedWorldsLoadedEvent;
 import club.sitmc.sitParkourLobby.inventory.InventoryListener;
 import club.sitmc.sitParkourLobby.inventory.InventoryManager;
+import club.sitmc.sitParkourLobby.menu.LeaderboardMenu;
+import club.sitmc.sitParkourLobby.menu.MapDetailMenu;
+import club.sitmc.sitParkourLobby.menu.MenuClockManager;
+import club.sitmc.sitParkourLobby.menu.ParkourMapListMenu;
+import club.sitmc.sitParkourLobby.menu.ParkourMenu;
 import java.io.File;
 import java.text.DecimalFormat;
 import java.text.DecimalFormatSymbols;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
@@ -62,6 +75,7 @@ public final class SITParkourLobby extends JavaPlugin implements CommandExecutor
     private static final String DATA_FILE_NAME = "data.yml";
     private static final String MAPS_DATA_PATH = "maps";
     private static final String MANAGED_WORLDS_DATA_PATH = "managed-worlds";
+    private static final String WORLD_META_DATA_PATH = "world-metadata";
     private static final String SCOREBOARD_TITLE = "&3&lSIT-Minecraft";
     private static final List<String> SCOREBOARD_TEMPLATE = List.of(
             "&b=====================",
@@ -83,11 +97,17 @@ public final class SITParkourLobby extends JavaPlugin implements CommandExecutor
     private final DecimalFormat hoursFormat = new DecimalFormat("0.0", DecimalFormatSymbols.getInstance(Locale.US));
     private final Set<String> allowedMaps = new HashSet<>();
     private final Set<String> managedWorlds = new HashSet<>();
+    /** 世界名 → 元数据（category/author/status/timingMode），完全由本插件自行管理 */
+    private final Map<String, WorldMeta> worldMetaMap = new LinkedHashMap<>();
     private YamlConfiguration dataConfig;
     private File dataFile;
     private int scoreboardTaskId = -1;
     private int settingsTaskId = -1;
     private InventoryManager inventoryManager;
+    private ParkourDataProvider dataProvider;
+    private ParkourMenu parkourMenu;
+    private SkinCacheManager skinCacheManager;
+    private MenuClockManager menuClockManager;
 
     @Override
     public void onEnable() {
@@ -95,6 +115,7 @@ public final class SITParkourLobby extends JavaPlugin implements CommandExecutor
         loadDataFile();
         loadAllowedMaps();
         loadManagedWorlds();
+        loadWorldMetadata();
 
         // 受管世界不在 onEnable 中加载（STARTUP 阶段禁止创建世界）
         // 改为在 ServerLoadEvent 触发后加载，见 onServerLoad + loadAllManagedWorlds
@@ -109,9 +130,16 @@ public final class SITParkourLobby extends JavaPlugin implements CommandExecutor
         registerCommand("create");
         registerCommand("falldamage");
         registerCommand("world");
+        registerCommand("menu");
 
         if (getCommand("map") != null) {
             getCommand("map").setTabCompleter(this);
+        }
+        if (getCommand("world") != null) {
+            getCommand("world").setTabCompleter(this);
+        }
+        if (getCommand("menu") != null) {
+            getCommand("menu").setTabCompleter(this);
         }
 
         Bukkit.getPluginManager().registerEvents(this, this);
@@ -119,6 +147,43 @@ public final class SITParkourLobby extends JavaPlugin implements CommandExecutor
         // 按世界独立背包
         inventoryManager = new InventoryManager(getDataFolder(), getLogger());
         Bukkit.getPluginManager().registerEvents(new InventoryListener(inventoryManager, getLogger()), this);
+
+        // 皮肤缓存管理器
+        skinCacheManager = new SkinCacheManager(getDataFolder(), getLogger());
+
+        // 跑酷菜单（三级菜单联动）
+        dataProvider = new ParkourDataProvider(getLogger());
+        // 注入自有元数据（不再反射 getParkourMaps）
+        dataProvider.setWorldMetadata(worldMetaMap);
+
+        LeaderboardMenu leaderboardMenu = new LeaderboardMenu(dataProvider, skinCacheManager, getLogger());
+        MapDetailMenu mapDetailMenu = new MapDetailMenu(dataProvider);
+        ParkourMapListMenu mapListMenu = new ParkourMapListMenu(dataProvider);
+        parkourMenu = new ParkourMenu(dataProvider);
+
+        // 注入引用链（解决循环依赖）
+        parkourMenu.setStatsProvider(uuid -> {
+            PlayerStats ps = getOrCreateStats(uuid);
+            return new long[]{ps.playtimeSeconds, ps.jumps};
+        });
+        parkourMenu.setMapListMenu(mapListMenu);
+        mapListMenu.setMainMenu(parkourMenu);
+        mapListMenu.setDetailMenu(mapDetailMenu);
+        mapDetailMenu.setMapListMenu(mapListMenu);
+        mapDetailMenu.setLeaderboardMenu(leaderboardMenu);
+        leaderboardMenu.setDetailMenu(mapDetailMenu);
+
+        // 注册监听器
+        Bukkit.getPluginManager().registerEvents(parkourMenu, this);
+        Bukkit.getPluginManager().registerEvents(mapListMenu, this);
+        Bukkit.getPluginManager().registerEvents(mapDetailMenu, this);
+        Bukkit.getPluginManager().registerEvents(leaderboardMenu, this);
+
+        // 菜单时钟管理器（slot 8 专属，独立于世界背包系统）
+        menuClockManager = new MenuClockManager(this, parkourMenu, getLogger());
+        menuClockManager.setPracCheck(this::isInPracMode);
+        parkourMenu.setPracCheck(this::isInPracMode);
+        Bukkit.getPluginManager().registerEvents(menuClockManager, this);
 
         Bukkit.setDefaultGameMode(GameMode.ADVENTURE);
         for (World world : Bukkit.getWorlds()) {
@@ -130,8 +195,10 @@ public final class SITParkourLobby extends JavaPlugin implements CommandExecutor
             setupScoreboard(player);
             applyPlayerEntryRules(player);
             lastOnGround.put(player.getUniqueId(), player.isOnGround());
+            menuClockManager.ensureClockInSlot(player);
         }
 
+        menuClockManager.startEnsureTask();
         startScoreboardTask();
         startSettingsTask();
         Bukkit.getScheduler().runTask(this, this::initializeNoCollisionTeam);
@@ -150,6 +217,9 @@ public final class SITParkourLobby extends JavaPlugin implements CommandExecutor
         if (settingsTaskId != -1) {
             Bukkit.getScheduler().cancelTask(settingsTaskId);
             settingsTaskId = -1;
+        }
+        if (menuClockManager != null) {
+            menuClockManager.stopEnsureTask();
         }
         saveAllPlayerStats();
     }
@@ -283,6 +353,45 @@ public final class SITParkourLobby extends JavaPlugin implements CommandExecutor
             return handleWorldCommand(sender, args);
         }
 
+        if (name.equals("menu")) {
+            // /menu skindebug <玩家名> — 皮肤缓存诊断（控制台也可用）
+            if (args.length >= 2 && args[0].equalsIgnoreCase("skindebug")) {
+                String targetName = args[1];
+                SkinCacheManager.SkinDebugInfo info = skinCacheManager.getDebugInfo(targetName);
+                send(sender, "&e===== 皮肤缓存诊断: &f" + targetName + " &e=====");
+                send(sender, "&b在线状态: " + (info.isOnline ? "&a在线" : "&7离线"));
+                send(sender, "&b是否有缓存: " + (info.hasCache ? "&a是" : "&c否"));
+                send(sender, "&b缓存文件路径: &f" + info.cacheFilePath);
+                if (info.cachedPlayerName != null) {
+                    send(sender, "&b缓存中的玩家名: &f" + info.cachedPlayerName);
+                }
+                if (info.texturesPreview != null) {
+                    send(sender, "&bTextures 预览: &f" + info.texturesPreview);
+                }
+                return true;
+            }
+
+            if (!(sender instanceof Player player)) {
+                send(sender, "只有玩家可以使用该命令。");
+                return true;
+            }
+
+            // 练习模式拦截
+            if (isInPracMode(player)) {
+                send(sender, "你正在练习模式中，无法打开菜单。");
+                return true;
+            }
+
+            // /menu (无参数) — 打开主菜单
+            if (args.length == 0) {
+                parkourMenu.openMainMenu(player);
+                return true;
+            }
+
+            send(sender, "用法: /menu 或 /menu skindebug <玩家名>");
+            return true;
+        }
+
         if (!(sender instanceof Player player)) {
             send(sender, "只有玩家可以使用该命令。");
             return true;
@@ -345,10 +454,23 @@ public final class SITParkourLobby extends JavaPlugin implements CommandExecutor
 
     @Override
     public List<String> onTabComplete(CommandSender sender, Command command, String alias, String[] args) {
+        String name = command.getName().toLowerCase(Locale.ROOT);
+
+        // /world 使用专用的多级补全（子命令 + 世界名 + 枚举值）
+        if (name.equals("world")) {
+            return tabCompleteWorld(sender, args);
+        }
+
+        // /menu 的多级补全（skindebug + 玩家名）
+        if (name.equals("menu")) {
+            return tabCompleteMenu(sender, args);
+        }
+
+        // 其余命令仅补全第一个参数（世界名）
         if (args.length != 1) {
             return List.of();
         }
-        String name = command.getName().toLowerCase(Locale.ROOT);
+
         String prefix = args[0].toLowerCase(Locale.ROOT);
 
         if (name.equals("map")) {
@@ -387,10 +509,6 @@ public final class SITParkourLobby extends JavaPlugin implements CommandExecutor
                     .toList();
         }
 
-        if (name.equals("world")) {
-            return tabCompleteWorld(sender, args);
-        }
-
         return List.of();
     }
 
@@ -421,6 +539,8 @@ public final class SITParkourLobby extends JavaPlugin implements CommandExecutor
         loadPlayerStats(player);
         setupScoreboard(player);
         lastOnGround.put(player.getUniqueId(), player.isOnGround());
+        // 缓存皮肤纹理（从 Paper PlayerProfile 中提取，不发起任何外部网络请求）
+        skinCacheManager.cacheSkin(player);
     }
 
     @EventHandler
@@ -646,6 +766,8 @@ public final class SITParkourLobby extends JavaPlugin implements CommandExecutor
         }
         dataConfig.set(MAPS_DATA_PATH, allowedMaps.stream().sorted().toList());
         dataConfig.set(MANAGED_WORLDS_DATA_PATH, managedWorlds.stream().sorted().toList());
+        // 同时保存世界元数据
+        saveWorldMetadataToConfig();
         try {
             dataConfig.save(dataFile);
         } catch (Exception ignored) {
@@ -743,6 +865,63 @@ public final class SITParkourLobby extends JavaPlugin implements CommandExecutor
     private boolean hasMapAdmin(CommandSender sender) {
         return sender.hasPermission("sitpk.addmap");
     }
+
+    // ==================== 练习/旁观模式拦截 ====================
+
+    /** SITSegment 插件实例引用（缓存，菜单拦截用） */
+    private Object segmentPluginInstance;
+    /** SITSegment#isPracticing(Player) 方法引用 */
+    private java.lang.reflect.Method segmentIsPracticingMethod;
+    /** SITSegment#isSpectating(Player) 方法引用 */
+    private java.lang.reflect.Method segmentIsSpectatingMethod;
+    /** 是否已尝试解析过 SITSegment 方法（避免重复警告） */
+    private boolean segmentMethodsResolved;
+
+    /**
+     * 尝试解析 SITSegment 的 isPracticing / isSpectating 方法。
+     * 仅在首次调用时执行，结果缓存到字段中。
+     * @return true 表示 SITSegment 可用且方法已解析成功
+     */
+    private boolean resolveSegmentMethods() {
+        if (segmentMethodsResolved) {
+            return segmentPluginInstance != null;
+        }
+        segmentMethodsResolved = true;
+
+        org.bukkit.plugin.Plugin plugin = Bukkit.getPluginManager().getPlugin("SITSegment");
+        if (plugin == null || !plugin.isEnabled()) {
+            return false;
+        }
+
+        try {
+            segmentIsPracticingMethod = plugin.getClass().getMethod("isPracticing", Player.class);
+            segmentIsSpectatingMethod = plugin.getClass().getMethod("isSpectating", Player.class);
+            segmentPluginInstance = plugin;
+            return true;
+        } catch (NoSuchMethodException e) {
+            getLogger().warning("[PracCheck] SITSegment 未提供 isPracticing/isSpectating 方法，"
+                    + "练习/旁观模式拦截不可用: " + e.getMessage());
+            return false;
+        }
+    }
+
+    /**
+     * 查询指定玩家是否处于练习模式（/prac）或旁观模式（/spec）。
+     * 若 SITSegment 不可用或反射失败，安全降级返回 false。
+     */
+    public boolean isInPracMode(Player player) {
+        if (!resolveSegmentMethods()) {
+            return false;
+        }
+        try {
+            boolean practicing = (boolean) segmentIsPracticingMethod.invoke(segmentPluginInstance, player);
+            boolean spectating = (boolean) segmentIsSpectatingMethod.invoke(segmentPluginInstance, player);
+            return practicing || spectating;
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
     private void incrementJumps(Player player) {
         PlayerStats playerStats = getOrCreateStats(player.getUniqueId());
         playerStats.jumps += 1;
@@ -793,6 +972,118 @@ public final class SITParkourLobby extends JavaPlugin implements CommandExecutor
         }
     }
 
+    // ==================== 世界元数据持久化 ====================
+
+    /**
+     * 从 data.yml 的 "world-metadata" 节点加载所有受管世界的元数据。
+     * 容错：缺字段/非法值回退默认（category 无默认=null，其余同枚举定义）。
+     */
+    private void loadWorldMetadata() {
+        worldMetaMap.clear();
+        ConfigurationSection section = dataConfig.getConfigurationSection(WORLD_META_DATA_PATH);
+        if (section == null) {
+            getLogger().info("[WorldMeta] data.yml 中无 world-metadata 节点，初始化为空。");
+            return;
+        }
+
+        int loaded = 0;
+        for (String worldName : section.getKeys(false)) {
+            ConfigurationSection worldSec = section.getConfigurationSection(worldName);
+            if (worldSec == null) continue;
+
+            WorldMeta meta = new WorldMeta();
+
+            // category: 四选一枚举，非法/缺失 → null（不计入任何分类）
+            String catStr = worldSec.getString("category");
+            if (catStr != null) {
+                meta.category = ParkourGameType.fromString(catStr);
+                if (meta.category == null) {
+                    getLogger().warning("[WorldMeta] 世界 " + worldName + " 的 category 值非法: " + catStr + "，视为未设置。");
+                }
+            }
+
+            // timingMode: 仅 PKW 有意义，缺省 null
+            String timingStr = worldSec.getString("timing-mode");
+            if (timingStr != null) {
+                meta.timingMode = TimingMode.fromString(timingStr);
+            }
+
+            // author: 默认 ""
+            meta.author = worldSec.getString("author", "");
+
+            // status: 大小写不敏感查找，缺省/非法 → UNRELEASED
+            String statusStr = worldSec.getString("status");
+            if (statusStr != null && !statusStr.isEmpty()) {
+                MapStatus parsed = MapStatus.fromKey(statusStr.toUpperCase());
+                meta.status = (parsed != MapStatus.UNKNOWN) ? parsed : MapStatus.UNRELEASED;
+                if (parsed == MapStatus.UNKNOWN) {
+                    getLogger().warning("[WorldMeta] 世界 " + worldName + " 的 status 值非法: " + statusStr + "，回退为 UNRELEASED。");
+                }
+            }
+
+            // 自定义图标（Bukkit Material 名），可选
+            meta.icon = worldSec.getString("icon");
+            if (meta.icon != null && meta.icon.isEmpty()) meta.icon = null;
+
+            // 自定义展示名，可选
+            meta.displayName = worldSec.getString("display-name");
+            if (meta.displayName != null && meta.displayName.isEmpty()) meta.displayName = null;
+
+            // 自定义类型展示名，可选
+            meta.typeName = worldSec.getString("type-name");
+            if (meta.typeName != null && meta.typeName.isEmpty()) meta.typeName = null;
+
+            // 难度描述，可选
+            meta.difficulty = worldSec.getString("difficulty");
+            if (meta.difficulty != null && meta.difficulty.isEmpty()) meta.difficulty = null;
+
+            // 地图简介，可选
+            meta.introduction = worldSec.getString("introduction");
+            if (meta.introduction != null && meta.introduction.isEmpty()) meta.introduction = null;
+
+            worldMetaMap.put(worldName, meta);
+            loaded++;
+        }
+
+        getLogger().info("[WorldMeta] 已加载 " + loaded + " 个世界的元数据。");
+    }
+
+    /**
+     * 将内存中的 worldMetaMap 序列化到 dataConfig 的 "world-metadata" 节点。
+     * 不立即 save 文件——由调用方（saveAllPlayerStats / 各命令处理）负责 save。
+     */
+    private void saveWorldMetadataToConfig() {
+        // 先清除旧节点，再全量重写（处理世界被移除的情况）
+        dataConfig.set(WORLD_META_DATA_PATH, null);
+
+        for (Map.Entry<String, WorldMeta> entry : worldMetaMap.entrySet()) {
+            String worldName = entry.getKey();
+            WorldMeta meta = entry.getValue();
+            String path = WORLD_META_DATA_PATH + "." + worldName;
+
+            dataConfig.set(path + ".category", meta.category != null ? meta.category.name() : null);
+            dataConfig.set(path + ".timing-mode", meta.timingMode != null ? meta.timingMode.name() : null);
+            dataConfig.set(path + ".author", meta.author != null ? meta.author : "");
+            dataConfig.set(path + ".status", meta.status != null ? meta.status.key : MapStatus.UNRELEASED.key);
+            dataConfig.set(path + ".icon", (meta.icon != null && !meta.icon.isEmpty()) ? meta.icon : null);
+            dataConfig.set(path + ".display-name", (meta.displayName != null && !meta.displayName.isEmpty()) ? meta.displayName : null);
+            dataConfig.set(path + ".type-name", (meta.typeName != null && !meta.typeName.isEmpty()) ? meta.typeName : null);
+            dataConfig.set(path + ".difficulty", (meta.difficulty != null && !meta.difficulty.isEmpty()) ? meta.difficulty : null);
+            dataConfig.set(path + ".introduction", (meta.introduction != null && !meta.introduction.isEmpty()) ? meta.introduction : null);
+        }
+    }
+
+    /**
+     * 保存世界元数据到磁盘。
+     */
+    private void saveWorldMetadata() {
+        saveWorldMetadataToConfig();
+        try {
+            dataConfig.save(dataFile);
+        } catch (Exception ignored) {
+        }
+    }
+
     // ==================== 服务器就绪后加载受管世界 ====================
 
     /**
@@ -813,9 +1104,33 @@ public final class SITParkourLobby extends JavaPlugin implements CommandExecutor
             }
         }
 
+        // 为所有受管世界中尚无元数据记录的世界初始化默认元数据
+        initMissingWorldMeta();
+
+        // 刷新数据提供者
+        dataProvider.setWorldMetadata(worldMetaMap);
+
         // 所有受管世界加载完成，广播事件通知其他插件（如 SITSegment）
         getLogger().info("所有受管世界加载完成，广播 ManagedWorldsLoadedEvent (受管世界数: " + managedWorlds.size() + ")");
         Bukkit.getPluginManager().callEvent(new ManagedWorldsLoadedEvent(List.copyOf(managedWorlds)));
+    }
+
+    /**
+     * 为受管世界中尚无元数据记录的世界创建默认 WorldMeta（category=null）。
+     * 确保每个受管世界在 worldMetaMap 中都有条目，方便 /world list 和后续配置。
+     */
+    private void initMissingWorldMeta() {
+        boolean changed = false;
+        for (String worldName : managedWorlds) {
+            if (!worldMetaMap.containsKey(worldName)) {
+                worldMetaMap.put(worldName, new WorldMeta());
+                changed = true;
+                getLogger().info("[WorldMeta] 为新受管世界初始化默认元数据: " + worldName);
+            }
+        }
+        if (changed) {
+            saveWorldMetadata();
+        }
     }
 
     private void loadSingleManagedWorld(String worldName) {
@@ -849,7 +1164,7 @@ public final class SITParkourLobby extends JavaPlugin implements CommandExecutor
         }
 
         if (args.length == 0) {
-            send(sender, "用法: /world <import|add|remove|tp|list> [世界名]");
+            send(sender, "用法: /world <import|add|remove|tp|list|category|timing|author|status|mapinfo> [参数...]");
             return true;
         }
 
@@ -866,8 +1181,28 @@ public final class SITParkourLobby extends JavaPlugin implements CommandExecutor
                 return handleWorldTp(sender, args);
             case "list":
                 return handleWorldList(sender);
+            case "category":
+                return handleWorldCategory(sender, args);
+            case "timing":
+                return handleWorldTiming(sender, args);
+            case "author":
+                return handleWorldAuthor(sender, args);
+            case "status":
+                return handleWorldStatus(sender, args);
+            case "mapinfo":
+                return handleWorldMapInfo(sender, args);
+            case "icon":
+                return handleWorldIcon(sender, args);
+            case "displayname":
+                return handleWorldDisplayName(sender, args);
+            case "typename":
+                return handleWorldTypeName(sender, args);
+            case "difficulty":
+                return handleWorldDifficulty(sender, args);
+            case "intro":
+                return handleWorldIntro(sender, args);
             default:
-                send(sender, "未知子命令: " + sub + "。可用: import, add, remove, tp, list");
+                send(sender, "未知子命令: " + sub + "。可用: import, add, remove, tp, list, category, timing, author, status, mapinfo, icon, displayname, typename, difficulty, intro");
                 return true;
         }
     }
@@ -915,7 +1250,17 @@ public final class SITParkourLobby extends JavaPlugin implements CommandExecutor
 
         managedWorlds.add(worldName);
         saveManagedWorlds();
-        send(sender, "已导入并纳入受管列表: " + worldName);
+
+        // 为新导入的世界初始化默认元数据
+        if (!worldMetaMap.containsKey(worldName)) {
+            worldMetaMap.put(worldName, new WorldMeta());
+            saveWorldMetadata();
+        }
+
+        // 刷新数据提供者
+        dataProvider.setWorldMetadata(worldMetaMap);
+
+        send(sender, "已导入并纳入受管列表: " + worldName + " &7(提示: 请用 /world category 设置玩法大类)");
         return true;
     }
 
@@ -953,7 +1298,17 @@ public final class SITParkourLobby extends JavaPlugin implements CommandExecutor
         placeSpawnBedrock(created);
         managedWorlds.add(worldName);
         saveManagedWorlds();
-        send(sender, "已创建虚空世界并纳入受管列表: " + worldName);
+
+        // 为新创建的世界初始化默认元数据
+        if (!worldMetaMap.containsKey(worldName)) {
+            worldMetaMap.put(worldName, new WorldMeta());
+            saveWorldMetadata();
+        }
+
+        // 刷新数据提供者
+        dataProvider.setWorldMetadata(worldMetaMap);
+
+        send(sender, "已创建虚空世界并纳入受管列表: " + worldName + " &7(提示: 请用 /world category 设置玩法大类)");
         if (sender instanceof Player player) {
             teleportToSpawn(player, created);
         }
@@ -994,7 +1349,15 @@ public final class SITParkourLobby extends JavaPlugin implements CommandExecutor
 
         managedWorlds.remove(worldName);
         saveManagedWorlds();
-        send(sender, "已卸载并从受管列表移除: " + worldName + " (世界文件夹已保留)");
+
+        // 清理元数据
+        worldMetaMap.remove(worldName);
+        saveWorldMetadata();
+
+        // 刷新数据提供者
+        dataProvider.setWorldMetadata(worldMetaMap);
+
+        send(sender, "已卸载并从受管列表移除: " + worldName + " (世界文件夹已保留，元数据已清理)");
         return true;
     }
 
@@ -1016,7 +1379,11 @@ public final class SITParkourLobby extends JavaPlugin implements CommandExecutor
         }
 
         teleportToSpawn(player, targetWorld);
-        send(sender, "已传送到世界: " + targetWorld.getName());
+        String worldName = targetWorld.getName();
+        WorldMeta meta = worldMetaMap.get(worldName);
+        String showName = (meta != null && meta.displayName != null && !meta.displayName.isEmpty())
+                ? meta.displayName : worldName;
+        send(sender, "已传送到: &b" + showName + " &7(" + worldName + ")");
         return true;
     }
 
@@ -1028,10 +1395,464 @@ public final class SITParkourLobby extends JavaPlugin implements CommandExecutor
 
         List<String> list = managedWorlds.stream().sorted().map(worldName -> {
             boolean loaded = Bukkit.getWorld(worldName) != null;
-            return (loaded ? "&a" : "&c") + worldName + (loaded ? "&f(已加载)" : "&f(未加载)");
+            WorldMeta meta = worldMetaMap.get(worldName);
+            String loadStatus = loaded ? "&a已加载" : "&c未加载";
+
+            String catStr;
+            if (meta == null || meta.category == null) {
+                catStr = "&e未设置分类";
+            } else {
+                catStr = "&f" + meta.category.chineseName;
+            }
+
+            String statusStr = "";
+            if (meta != null && meta.status != null) {
+                statusStr = " " + meta.status.colorCode + meta.status.chineseName;
+            }
+
+            return (loaded ? "&a" : "&c") + worldName
+                    + "&7(" + loadStatus + "&7, " + catStr + "&7" + statusStr + "&7)";
         }).toList();
 
         send(sender, "受管世界(" + managedWorlds.size() + "): " + String.join("&7, ", list));
+        return true;
+    }
+
+    // ==================== /world category ====================
+
+    private boolean handleWorldCategory(CommandSender sender, String[] args) {
+        // /world category — 列出未设置分类的世界
+        if (args.length < 2 || args[1].equalsIgnoreCase("list")) {
+            List<String> uncategorized = managedWorlds.stream()
+                    .filter(w -> {
+                        WorldMeta meta = worldMetaMap.get(w);
+                        return meta == null || meta.category == null;
+                    })
+                    .sorted()
+                    .toList();
+
+            if (uncategorized.isEmpty()) {
+                send(sender, "&a所有受管世界均已设置分类。");
+            } else {
+                send(sender, "&e未设置分类的受管世界 (" + uncategorized.size() + "): &f" + String.join("&7, &f", uncategorized));
+                send(sender, "&7使用 &f/world category <世界名> <PKW|SEGMENT|ONLYSPRINT|RANKUP> &7设置分类。");
+            }
+            return true;
+        }
+
+        // /world category <世界名> <PKW|SEGMENT|ONLYSPRINT|RANKUP>
+        if (args.length < 3) {
+            send(sender, "用法: /world category <世界名> <PKW|SEGMENT|ONLYSPRINT|RANKUP>");
+            send(sender, "或  /world category list  — 查看未设置分类的世界");
+            return true;
+        }
+
+        String worldName = args[1];
+        if (!managedWorlds.contains(worldName)) {
+            send(sender, "该世界不在受管列表中: " + worldName);
+            return true;
+        }
+
+        ParkourGameType category = ParkourGameType.fromString(args[2]);
+        if (category == null) {
+            send(sender, "非法分类: " + args[2] + "。可选: PKW, SEGMENT, ONLYSPRINT, RANKUP");
+            return true;
+        }
+
+        WorldMeta meta = worldMetaMap.computeIfAbsent(worldName, k -> new WorldMeta());
+        meta.category = category;
+
+        // 如果从 PKW 切换到非 PKW，清除 timingMode
+        if (category != ParkourGameType.PKW) {
+            meta.timingMode = null;
+        }
+
+        saveWorldMetadata();
+        dataProvider.setWorldMetadata(worldMetaMap);
+        send(sender, "世界 " + worldName + " 的玩法大类已设置为: &b" + category.chineseName + " &7(" + category.name() + ")");
+        return true;
+    }
+
+    // ==================== /world timing ====================
+
+    private boolean handleWorldTiming(CommandSender sender, String[] args) {
+        if (args.length < 3) {
+            send(sender, "用法: /world timing <世界名> <COUNTUP|COUNTDOWN>");
+            return true;
+        }
+
+        String worldName = args[1];
+        if (!managedWorlds.contains(worldName)) {
+            send(sender, "该世界不在受管列表中: " + worldName);
+            return true;
+        }
+
+        WorldMeta meta = worldMetaMap.get(worldName);
+        if (meta == null || meta.category == null) {
+            send(sender, "请先设置该世界的玩法大类: /world category " + worldName + " <类型>");
+            return true;
+        }
+
+        if (meta.category != ParkourGameType.PKW) {
+            send(sender, "仅 PKW 类型可设置计时模式。当前分类: " + meta.category.chineseName);
+            return true;
+        }
+
+        TimingMode timing = TimingMode.fromString(args[2]);
+        if (timing == null) {
+            send(sender, "非法计时模式: " + args[2] + "。可选: COUNTUP, COUNTDOWN");
+            return true;
+        }
+
+        meta.timingMode = timing;
+        saveWorldMetadata();
+        dataProvider.setWorldMetadata(worldMetaMap);
+        send(sender, "世界 " + worldName + " 的计时模式已设置为: &b" + timing.chineseName + " &7(" + timing.name() + ")");
+        return true;
+    }
+
+    // ==================== /world author ====================
+
+    private boolean handleWorldAuthor(CommandSender sender, String[] args) {
+        if (args.length < 2) {
+            send(sender, "用法: /world author <世界名> <作者名>");
+            return true;
+        }
+
+        String worldName = args[1];
+        if (!managedWorlds.contains(worldName)) {
+            send(sender, "该世界不在受管列表中: " + worldName);
+            return true;
+        }
+
+        // 作者名可包含空格：从 args[2] 开始拼接
+        String author;
+        if (args.length >= 3) {
+            StringBuilder sb = new StringBuilder(args[2]);
+            for (int i = 3; i < args.length; i++) {
+                sb.append(' ').append(args[i]);
+            }
+            author = sb.toString();
+        } else {
+            author = "";
+        }
+
+        WorldMeta meta = worldMetaMap.computeIfAbsent(worldName, k -> new WorldMeta());
+        // & → § 转换后存储，与 displayName/typeName 一致
+        meta.author = (!author.isEmpty())
+                ? org.bukkit.ChatColor.translateAlternateColorCodes('&', author) : "";
+        saveWorldMetadata();
+        dataProvider.setWorldMetadata(worldMetaMap);
+
+        if (author.isEmpty()) {
+            send(sender, "世界 " + worldName + " 的作者已清除。");
+        } else {
+            send(sender, "世界 " + worldName + " 的作者已设置为: &b" + author);
+        }
+        return true;
+    }
+
+    // ==================== /world status ====================
+
+    private boolean handleWorldStatus(CommandSender sender, String[] args) {
+        if (args.length < 3) {
+            send(sender, "用法: /world status <世界名> <OPEN|CLOSED|UNRELEASED|EVENT|TESTING>");
+            return true;
+        }
+
+        String worldName = args[1];
+        if (!managedWorlds.contains(worldName)) {
+            send(sender, "该世界不在受管列表中: " + worldName);
+            return true;
+        }
+
+        // 大小写不敏感查找
+        MapStatus status = MapStatus.fromKey(args[2].toUpperCase());
+        if (status == MapStatus.UNKNOWN) {
+            send(sender, "非法状态: " + args[2] + "。可选: OPEN, CLOSED, UNRELEASED, EVENT, TESTING");
+            return true;
+        }
+
+        WorldMeta meta = worldMetaMap.computeIfAbsent(worldName, k -> new WorldMeta());
+        meta.status = status;
+        saveWorldMetadata();
+        dataProvider.setWorldMetadata(worldMetaMap);
+        send(sender, "世界 " + worldName + " 的状态已设置为: " + status.colorCode + status.chineseName + " &7(" + status.key + ")");
+        return true;
+    }
+
+    // ==================== /world mapinfo ====================
+
+    private boolean handleWorldMapInfo(CommandSender sender, String[] args) {
+        if (args.length < 2) {
+            send(sender, "用法: /world mapinfo <世界名>");
+            return true;
+        }
+
+        String worldName = args[1];
+        if (!managedWorlds.contains(worldName)) {
+            send(sender, "该世界不在受管列表中: " + worldName);
+            return true;
+        }
+
+        WorldMeta meta = worldMetaMap.get(worldName);
+        if (meta == null) {
+            send(sender, "世界 " + worldName + " 暂无元数据，请先使用 /world category 设置分类。");
+            return true;
+        }
+
+        boolean loaded = Bukkit.getWorld(worldName) != null;
+
+        send(sender, "&b===== 地图元数据: &f" + worldName + " &b=====");
+        send(sender, "&7世界名: &f" + worldName);
+        send(sender, "&7加载状态: " + (loaded ? "&a已加载" : "&c未加载"));
+
+        if (meta.category != null) {
+            send(sender, "&7玩法大类: &f" + meta.category.chineseName + " &7(" + meta.category.name() + ")");
+        } else {
+            send(sender, "&7玩法大类: &e未设置");
+        }
+
+        if (meta.category == ParkourGameType.PKW && meta.timingMode != null) {
+            send(sender, "&7计时模式: &f" + meta.timingMode.chineseName + " &7(" + meta.timingMode.name() + ")");
+        } else if (meta.category == ParkourGameType.PKW) {
+            send(sender, "&7计时模式: &e未设置 &7(仅PKW类型需要)");
+        }
+
+        send(sender, "&7作者: &f" + (meta.author != null && !meta.author.isEmpty() ? meta.author : "—"));
+        send(sender, "&7状态: " + meta.status.colorCode + meta.status.chineseName + " &7(" + meta.status.key + ")");
+
+        // 新增四个自定义字段
+        send(sender, "&7自定义图标: " + (meta.icon != null ? "&f" + meta.icon + (meta.resolveIcon() == null ? " &c(非法材质)" : "") : "&8(默认)"));
+        send(sender, "&7展示名: " + (meta.displayName != null ? "&f" + meta.displayName : "&8(默认, 使用世界名)"));
+        send(sender, "&7类型展示名: " + (meta.typeName != null ? "&f" + meta.typeName : "&8(默认, 使用类型映射)"));
+        send(sender, "&7难度: " + (meta.difficulty != null ? "&f" + meta.difficulty : "&8(未设置, 不显示)"));
+        send(sender, "&7简介: " + (meta.introduction != null ? "&f" + meta.introduction : "&8(未设置, 不显示)"));
+        return true;
+    }
+
+    // ==================== /world icon ====================
+
+    private boolean handleWorldIcon(CommandSender sender, String[] args) {
+        if (args.length < 3) {
+            send(sender, "用法: /world icon <世界名> <材质名|reset>");
+            send(sender, "&7重置为默认: /world icon <世界名> reset");
+            send(sender, "&7常用材质示例: DIAMOND_BLOCK, EMERALD_BLOCK, NETHER_STAR, PLAYER_HEAD, ENDER_PEARL");
+            return true;
+        }
+
+        String worldName = args[1];
+        if (!managedWorlds.contains(worldName)) {
+            send(sender, "该世界不在受管列表中: " + worldName);
+            return true;
+        }
+
+        String value = args[2];
+
+        // 清除/重置
+        if (value.equalsIgnoreCase("reset")) {
+            WorldMeta meta = worldMetaMap.get(worldName);
+            if (meta != null) meta.icon = null;
+            saveWorldMetadata();
+            dataProvider.setWorldMetadata(worldMetaMap);
+            send(sender, "世界 " + worldName + " 的自定义图标已清除，恢复默认。");
+            return true;
+        }
+
+        // 校验材质合法性
+        Material mat = Material.matchMaterial(value);
+        if (mat == null || !mat.isItem()) {
+            send(sender, "&c非法材质名: " + value + "。请使用 Bukkit Material 枚举名。");
+            send(sender, "&7常用示例: DIAMOND_BLOCK, EMERALD_BLOCK, NETHER_STAR, PLAYER_HEAD, ENDER_PEARL, GLOBE_BANNER_PATTERN");
+            return true;
+        }
+
+        WorldMeta meta = worldMetaMap.computeIfAbsent(worldName, k -> new WorldMeta());
+        meta.icon = mat.name(); // 存规范名
+        saveWorldMetadata();
+        dataProvider.setWorldMetadata(worldMetaMap);
+        send(sender, "世界 " + worldName + " 的自定义图标已设置为: &b" + mat.name());
+        return true;
+    }
+
+    // ==================== /world displayname ====================
+
+    private boolean handleWorldDisplayName(CommandSender sender, String[] args) {
+        if (args.length < 2) {
+            send(sender, "用法: /world displayname <世界名> <展示名...|reset>");
+            send(sender, "&7重置为默认: /world displayname <世界名> reset");
+            send(sender, "&7支持颜色代码 &0-9a-fk-o 和空格");
+            return true;
+        }
+
+        String worldName = args[1];
+        if (!managedWorlds.contains(worldName)) {
+            send(sender, "该世界不在受管列表中: " + worldName);
+            return true;
+        }
+
+        // 若第三个参数是 reset，清除
+        String value;
+        if (args.length >= 3 && args[2].equalsIgnoreCase("reset")) {
+            value = null;
+        } else if (args.length >= 3) {
+            StringBuilder sb = new StringBuilder(args[2]);
+            for (int i = 3; i < args.length; i++) {
+                sb.append(' ').append(args[i]);
+            }
+            value = sb.toString();
+        } else {
+            send(sender, "用法: /world displayname <世界名> <展示名...|reset>");
+            return true;
+        }
+
+        WorldMeta meta = worldMetaMap.computeIfAbsent(worldName, k -> new WorldMeta());
+        // & → § 转换后存储，确保 § 格式在菜单中直接可用
+        meta.displayName = (value != null && !value.isEmpty())
+                ? org.bukkit.ChatColor.translateAlternateColorCodes('&', value) : null;
+        saveWorldMetadata();
+        dataProvider.setWorldMetadata(worldMetaMap);
+
+        if (meta.displayName == null) {
+            send(sender, "世界 " + worldName + " 的展示名已清除，恢复使用世界名。");
+        } else {
+            send(sender, "世界 " + worldName + " 的展示名已设置为: &b" + meta.displayName);
+        }
+        return true;
+    }
+
+    // ==================== /world typename ====================
+
+    private boolean handleWorldTypeName(CommandSender sender, String[] args) {
+        if (args.length < 2) {
+            send(sender, "用法: /world typename <世界名> <类型展示名...|reset>");
+            send(sender, "&7重置为默认: /world typename <世界名> reset");
+            send(sender, "&7支持颜色代码 &0-9a-fk-o 和空格");
+            return true;
+        }
+
+        String worldName = args[1];
+        if (!managedWorlds.contains(worldName)) {
+            send(sender, "该世界不在受管列表中: " + worldName);
+            return true;
+        }
+
+        String value;
+        if (args.length >= 3 && args[2].equalsIgnoreCase("reset")) {
+            value = null;
+        } else if (args.length >= 3) {
+            StringBuilder sb = new StringBuilder(args[2]);
+            for (int i = 3; i < args.length; i++) {
+                sb.append(' ').append(args[i]);
+            }
+            value = sb.toString();
+        } else {
+            send(sender, "用法: /world typename <世界名> <类型展示名...|reset>");
+            return true;
+        }
+
+        WorldMeta meta = worldMetaMap.computeIfAbsent(worldName, k -> new WorldMeta());
+        // & → § 转换后存储
+        meta.typeName = (value != null && !value.isEmpty())
+                ? org.bukkit.ChatColor.translateAlternateColorCodes('&', value) : null;
+        saveWorldMetadata();
+        dataProvider.setWorldMetadata(worldMetaMap);
+
+        if (meta.typeName == null) {
+            send(sender, "世界 " + worldName + " 的类型展示名已清除，恢复默认类型映射。");
+        } else {
+            send(sender, "世界 " + worldName + " 的类型展示名已设置为: &b" + meta.typeName);
+        }
+        return true;
+    }
+
+    // ==================== /world difficulty ====================
+
+    private boolean handleWorldDifficulty(CommandSender sender, String[] args) {
+        if (args.length < 2) {
+            send(sender, "用法: /world difficulty <世界名> <难度描述...|reset>");
+            send(sender, "&7重置为默认: /world difficulty <世界名> reset");
+            send(sender, "&7支持颜色代码 &0-9a-fk-o 和空格");
+            return true;
+        }
+
+        String worldName = args[1];
+        if (!managedWorlds.contains(worldName)) {
+            send(sender, "该世界不在受管列表中: " + worldName);
+            return true;
+        }
+
+        String value;
+        if (args.length >= 3 && args[2].equalsIgnoreCase("reset")) {
+            value = null;
+        } else if (args.length >= 3) {
+            StringBuilder sb = new StringBuilder(args[2]);
+            for (int i = 3; i < args.length; i++) {
+                sb.append(' ').append(args[i]);
+            }
+            value = sb.toString();
+        } else {
+            send(sender, "用法: /world difficulty <世界名> <难度描述...|reset>");
+            return true;
+        }
+
+        WorldMeta meta = worldMetaMap.computeIfAbsent(worldName, k -> new WorldMeta());
+        // & → § 转换后存储
+        meta.difficulty = (value != null && !value.isEmpty())
+                ? org.bukkit.ChatColor.translateAlternateColorCodes('&', value) : null;
+        saveWorldMetadata();
+        dataProvider.setWorldMetadata(worldMetaMap);
+
+        if (meta.difficulty == null) {
+            send(sender, "世界 " + worldName + " 的难度已清除，不再显示难度行。");
+        } else {
+            send(sender, "世界 " + worldName + " 的难度已设置为: &b" + meta.difficulty);
+        }
+        return true;
+    }
+
+    // ==================== /world intro ====================
+
+    private boolean handleWorldIntro(CommandSender sender, String[] args) {
+        if (args.length < 2) {
+            send(sender, "用法: /world intro <世界名> <简介内容...|reset>");
+            send(sender, "&7重置为默认: /world intro <世界名> reset");
+            send(sender, "&7支持颜色代码 &0-9a-fk-o 和空格");
+            return true;
+        }
+
+        String worldName = args[1];
+        if (!managedWorlds.contains(worldName)) {
+            send(sender, "该世界不在受管列表中: " + worldName);
+            return true;
+        }
+
+        String value;
+        if (args.length >= 3 && args[2].equalsIgnoreCase("reset")) {
+            value = null;
+        } else if (args.length >= 3) {
+            StringBuilder sb = new StringBuilder(args[2]);
+            for (int i = 3; i < args.length; i++) {
+                sb.append(' ').append(args[i]);
+            }
+            value = sb.toString();
+        } else {
+            send(sender, "用法: /world intro <世界名> <简介内容...|reset>");
+            return true;
+        }
+
+        WorldMeta meta = worldMetaMap.computeIfAbsent(worldName, k -> new WorldMeta());
+        // & → § 转换后存储
+        meta.introduction = (value != null && !value.isEmpty())
+                ? org.bukkit.ChatColor.translateAlternateColorCodes('&', value) : null;
+        saveWorldMetadata();
+        dataProvider.setWorldMetadata(worldMetaMap);
+
+        if (meta.introduction == null) {
+            send(sender, "世界 " + worldName + " 的简介已清除，不再显示。");
+        } else {
+            send(sender, "世界 " + worldName + " 的简介已设置为: &b" + meta.introduction);
+        }
         return true;
     }
 
@@ -1042,24 +1863,28 @@ public final class SITParkourLobby extends JavaPlugin implements CommandExecutor
             return List.of();
         }
 
+        // ---- 第一级：子命令名 ----
         if (args.length == 1) {
             String prefix = args[0].toLowerCase(Locale.ROOT);
-            return List.of("import", "add", "remove", "tp", "list").stream()
+            return List.of("import", "add", "remove", "tp", "list",
+                    "category", "timing", "author", "status", "mapinfo",
+                    "icon", "displayname", "typename", "difficulty", "intro").stream()
                     .filter(sub -> sub.startsWith(prefix))
                     .toList();
         }
 
+        String sub = args[0].toLowerCase(Locale.ROOT);
+
+        // ---- 第二级：世界名（按子命令语义筛选未配置项） ----
         if (args.length == 2) {
-            String sub = args[0].toLowerCase(Locale.ROOT);
             String prefix = args[1].toLowerCase(Locale.ROOT);
+
             switch (sub) {
                 case "import":
                     // 建议存在文件夹但未在受管列表中的世界
                     File container = Bukkit.getWorldContainer();
                     File[] dirs = container.listFiles(File::isDirectory);
-                    if (dirs == null) {
-                        return List.of();
-                    }
+                    if (dirs == null) return List.of();
                     return java.util.Arrays.stream(dirs)
                             .map(File::getName)
                             .filter(name -> !managedWorlds.contains(name))
@@ -1068,16 +1893,68 @@ public final class SITParkourLobby extends JavaPlugin implements CommandExecutor
                             .toList();
 
                 case "remove":
-                    // 建议受管列表中的世界
+                case "tp":
+                case "mapinfo":
+                case "icon":
+                case "displayname":
+                case "typename":
+                case "difficulty":
+                case "intro":
+                    // 操作类/自定义字段命令：显示全部受管世界
                     return managedWorlds.stream()
                             .filter(name -> name.toLowerCase(Locale.ROOT).startsWith(prefix))
                             .sorted()
                             .toList();
 
-                case "tp":
-                    // 建议已加载的世界
-                    return Bukkit.getWorlds().stream()
-                            .map(World::getName)
+                case "category": {
+                    // 仅显示未设置 category 的世界 + "list" 关键字
+                    List<String> suggestions = new java.util.ArrayList<>(
+                            managedWorlds.stream()
+                                    .filter(name -> {
+                                        WorldMeta m = worldMetaMap.get(name);
+                                        return m == null || m.category == null;
+                                    })
+                                    .filter(name -> name.toLowerCase(Locale.ROOT).startsWith(prefix))
+                                    .sorted()
+                                    .toList()
+                    );
+                    if ("list".startsWith(prefix)) {
+                        suggestions.add("list");
+                    }
+                    return suggestions;
+                }
+
+                case "timing":
+                    // 仅显示 category=PKW 且未设置 timingMode 的世界
+                    return managedWorlds.stream()
+                            .filter(name -> {
+                                WorldMeta m = worldMetaMap.get(name);
+                                return m != null
+                                        && m.category == ParkourGameType.PKW
+                                        && m.timingMode == null;
+                            })
+                            .filter(name -> name.toLowerCase(Locale.ROOT).startsWith(prefix))
+                            .sorted()
+                            .toList();
+
+                case "author":
+                    // 仅显示未设置 author（空字符串或 null）的世界
+                    return managedWorlds.stream()
+                            .filter(name -> {
+                                WorldMeta m = worldMetaMap.get(name);
+                                return m == null || m.author == null || m.author.isEmpty();
+                            })
+                            .filter(name -> name.toLowerCase(Locale.ROOT).startsWith(prefix))
+                            .sorted()
+                            .toList();
+
+                case "status":
+                    // 仅显示 status 仍为默认值 UNRELEASED 的世界
+                    return managedWorlds.stream()
+                            .filter(name -> {
+                                WorldMeta m = worldMetaMap.get(name);
+                                return m == null || m.status == MapStatus.UNRELEASED;
+                            })
                             .filter(name -> name.toLowerCase(Locale.ROOT).startsWith(prefix))
                             .sorted()
                             .toList();
@@ -1085,6 +1962,77 @@ public final class SITParkourLobby extends JavaPlugin implements CommandExecutor
                 default:
                     return List.of();
             }
+        }
+
+        // ---- 第三级：枚举值补全 ----
+        if (args.length == 3) {
+            String prefix = args[2].toLowerCase(Locale.ROOT);
+
+            switch (sub) {
+                case "category":
+                    // /world category <世界名> <PKW|SEGMENT|ONLYSPRINT|RANKUP>
+                    return ParkourGameType.enumNames().stream()
+                            .filter(name -> name.toLowerCase(Locale.ROOT).startsWith(prefix))
+                            .toList();
+
+                case "timing": {
+                    // /world timing <世界名> <COUNTUP|COUNTDOWN>
+                    // 上下文感知：若世界已是PKW，提示两个选项；若未知或非PKW也提示（由命令层校验）
+                    return java.util.Arrays.stream(TimingMode.values())
+                            .map(Enum::name)
+                            .filter(name -> name.toLowerCase(Locale.ROOT).startsWith(prefix))
+                            .toList();
+                }
+
+                case "status":
+                    // /world status <世界名> <OPEN|CLOSED|UNRELEASED|EVENT|TESTING>
+                    return java.util.Arrays.stream(MapStatus.values())
+                            .filter(s -> s != MapStatus.UNKNOWN)
+                            .map(s -> s.key)
+                            .filter(key -> key.toLowerCase(Locale.ROOT).startsWith(prefix))
+                            .toList();
+
+                case "icon":
+                    // /world icon <世界名> <材质名|reset>
+                    return List.of("DIAMOND_BLOCK", "EMERALD_BLOCK", "NETHER_STAR",
+                            "PLAYER_HEAD", "ENDER_PEARL", "FILLED_MAP",
+                            "GLOBE_BANNER_PATTERN", "CREEPER_BANNER_PATTERN",
+                            "FIELD_MASONED_BANNER_PATTERN", "GUSTER_BANNER_PATTERN",
+                            "FLOWER_BANNER_PATTERN", "MOJANG_BANNER_PATTERN",
+                            "EXPERIENCE_BOTTLE", "BOOK", "ENCHANTED_BOOK",
+                            "GOLDEN_APPLE", "FIREWORK_ROCKET", "BEACON",
+                            "reset").stream()
+                            .filter(name -> name.toLowerCase(Locale.ROOT).startsWith(prefix))
+                            .toList();
+
+                default:
+                    return List.of();
+            }
+        }
+
+        // ---- /world displayname/typename/difficulty 第三级及以后无需补全（自由文本） ----
+        return List.of();
+    }
+
+    // ==================== /menu Tab 补全 ====================
+
+    private List<String> tabCompleteMenu(CommandSender sender, String[] args) {
+        if (args.length == 0) return List.of();
+
+        if (args.length == 1) {
+            String prefix = args[0].toLowerCase(Locale.ROOT);
+            return java.util.stream.Stream.of("skindebug")
+                    .filter(sub -> sub.startsWith(prefix))
+                    .toList();
+        }
+
+        if (args.length == 2 && args[0].equalsIgnoreCase("skindebug")) {
+            String prefix = args[1].toLowerCase(Locale.ROOT);
+            return Bukkit.getOnlinePlayers().stream()
+                    .map(Player::getName)
+                    .filter(n -> n.toLowerCase(Locale.ROOT).startsWith(prefix))
+                    .sorted()
+                    .toList();
         }
 
         return List.of();
