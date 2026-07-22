@@ -51,6 +51,8 @@ public class ParkourMenu implements Listener {
     private static final int SLOT_ONLYSPRINT = 14;
     private static final int SLOT_PKW = 16;
     private static final int SLOT_PLAYER_INFO = 22;
+    /** 练习模式入口图标 — 玩家信息后第 2 格（slot 24） */
+    private static final int SLOT_PRACTICE = 24;
 
     /** 边框物品 */
     private static final ItemStack BORDER = createBorder();
@@ -91,7 +93,8 @@ public class ParkourMenu implements Listener {
 
     /**
      * 按可见字符宽度换行，保留 § 格式码跨行延续。
-     * 原始文本中的 {@code \n} 视为强制换行，每段再按 maxChars 软换行。
+     * 原始文本中的真实换行符（{@code \n}）或字面量字符串 {@code \n}（反斜杠+n）均视为强制换行，
+     * 每段再按 maxChars 软换行。
      *
      * @param text     含 § 格式码的文本
      * @param maxChars 每行最大可见字符数（不计 § 码）
@@ -101,6 +104,8 @@ public class ParkourMenu implements Listener {
         if (text == null || text.isEmpty()) return List.of();
         List<String> result = new ArrayList<>();
 
+        // 将文本中的字面量 \n（两个字符）替换为真实换行符，实现强制换行
+        text = text.replace("\\n", "\n");
         // 先按显式换行切段
         String[] segments = text.split("\n", -1);
         for (String segment : segments) {
@@ -281,6 +286,9 @@ public class ParkourMenu implements Listener {
 
         inv.setItem(SLOT_PLAYER_INFO, createPlayerInfoIcon(player));
 
+        // 练习模式入口（绿宝石图标，玩家信息后第 2 格）
+        inv.setItem(SLOT_PRACTICE, createPracticeIcon());
+
         player.openInventory(inv);
     }
 
@@ -303,6 +311,7 @@ public class ParkourMenu implements Listener {
         List<String> lore = new ArrayList<>();
         lore.add("§7§m--------------------");
         lore.add("§7地图数量: §f" + mapCount + " §7个");
+        lore.add("");
         // subtitle 按 \n 拆分为多行 lore（text block 的换行符即 \n）
         for (String line : subtitle.split("\n")) {
             lore.add(line);
@@ -353,7 +362,11 @@ public class ParkourMenu implements Listener {
         List<String> lore = new ArrayList<>();
         lore.add("§7§m--------------------");
         lore.add("§7延迟: §f" + ping + " §7ms");
-        lore.add("§7所在世界: §f" + worldName);
+        club.sitmc.sitParkourLobby.data.WorldMeta wm = dataProvider.getWorldMetadata().get(worldName);
+        String worldDisplayName = (wm != null && wm.displayName != null && !wm.displayName.isEmpty())
+                ? wm.displayName
+                : worldName;
+        lore.add("§7所在世界: §f" + worldDisplayName);
         if (statsAvailable) {
             lore.add("§7跳跃次数: §f" + jumps);
             lore.add("§7游玩时间: §f" + playtimeHours + " §7小时");
@@ -365,6 +378,26 @@ public class ParkourMenu implements Listener {
         meta.lore(colorizeList(lore));
         skull.setItemMeta(meta);
         return skull;
+    }
+
+    /**
+     * 创建练习模式入口图标（绿宝石）。
+     *
+     * <p>点击后关闭菜单并执行 /prac 命令进入练习模式。
+     * 退出练习请使用时钟（菜单时钟在 prac 状态下点击会执行 /unprac）。</p>
+     */
+    private ItemStack createPracticeIcon() {
+        ItemStack item = new ItemStack(Material.EMERALD);
+        ItemMeta meta = item.getItemMeta();
+        meta.displayName(colorize("§a练习模式"));
+
+        List<String> lore = new ArrayList<>();
+        lore.add("§7点击进入练习模式");
+        lore.add("§7点击菜单退出练习");
+        meta.lore(colorizeList(lore));
+
+        item.setItemMeta(meta);
+        return item;
     }
 
     // ==================== 边框 ====================
@@ -417,6 +450,15 @@ public class ParkourMenu implements Listener {
             case SLOT_SEGMENT -> mapListMenu.openMapList(player, ParkourGameType.SEGMENT, 0);
             case SLOT_ONLYSPRINT -> mapListMenu.openMapList(player, ParkourGameType.ONLYSPRINT, 0);
             case SLOT_RANKUP -> mapListMenu.openMapList(player, ParkourGameType.RANKUP, 0);
+            case SLOT_PRACTICE -> {
+                player.closeInventory();
+                boolean success = player.performCommand("prac");
+                if (!success) {
+                    player.sendMessage(LegacyComponentSerializer.legacyAmpersand()
+                            .deserialize("&3&lSIT-Parkour &8| &c无法执行进入练习模式命令，"
+                                    + "请确认 SITSegment 已安装。"));
+                }
+            }
             // SLOT_PLAYER_INFO — 暂不处理（占位）
         }
     }

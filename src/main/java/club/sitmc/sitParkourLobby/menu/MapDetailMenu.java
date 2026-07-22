@@ -136,7 +136,7 @@ public class MapDetailMenu implements Listener {
         if (!introduction.isEmpty()) {
             lore.add("");
             String introText = introduction.startsWith("§") ? introduction : "§7" + introduction;
-            lore.addAll(ParkourMenu.wrapText(introText, 12));
+            lore.addAll(ParkourMenu.wrapText(introText, 24));
         }
 
         meta.lore(ParkourMenu.colorizeList(lore));

@@ -44,6 +44,10 @@ public class WorldMeta {
     public String difficulty;
     /** 地图简介，null=不显示简介 */
     public String introduction;
+    /** 固定槽位页码（1-based），-1 = 未设置 */
+    public int fixedPage = -1;
+    /** 固定槽位号（0~44），-1 = 未设置 */
+    public int fixedSlot = -1;
 
     public WorldMeta() {}
 
@@ -106,6 +110,13 @@ public class WorldMeta {
         map.put("icon", icon != null ? icon : "");
         map.put("difficulty", difficulty != null ? difficulty : "");
         map.put("introduction", introduction != null ? introduction : "");
+
+        // 固定槽位：仅有效时写入（菜单层通过 containsKey 判断）
+        if (fixedPage >= 1 && fixedSlot >= 0 && fixedSlot < 45) {
+            map.put("fixedPage", String.valueOf(fixedPage));
+            map.put("fixedSlot", String.valueOf(fixedSlot));
+        }
+
         return map;
     }
 
@@ -148,6 +159,8 @@ public class WorldMeta {
                 + ", typeName='" + typeName + '\''
                 + ", difficulty='" + difficulty + '\''
                 + ", introduction='" + introduction + '\''
+                + ", fixedPage=" + fixedPage
+                + ", fixedSlot=" + fixedSlot
                 + '}';
     }
 }

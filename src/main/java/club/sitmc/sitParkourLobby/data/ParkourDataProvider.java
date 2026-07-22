@@ -59,7 +59,7 @@ public class ParkourDataProvider {
         BOARD_TO_CHINESE.put(BOARD_STANDARD, "标准榜");
         BOARD_TO_CHINESE.put(BOARD_ADVANCE, "进阶榜");
         BOARD_TO_CHINESE.put(BOARD_EXPECT, "卓越榜");
-        BOARD_TO_CHINESE.put(BOARD_COUNTDOWN, "倒计时榜");
+        BOARD_TO_CHINESE.put(BOARD_COUNTDOWN, "得分榜");
         BOARD_TO_CHINESE.put(BOARD_MAIN, "排行榜");
     }
 

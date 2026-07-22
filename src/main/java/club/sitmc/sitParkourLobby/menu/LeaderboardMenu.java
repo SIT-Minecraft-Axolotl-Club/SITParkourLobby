@@ -97,7 +97,12 @@ public class LeaderboardMenu implements Listener {
 
         List<String> boardNames = resolveBoardNames(type);
 
-        String title = "§b§l排行榜";
+        // 排行榜标题中包含地图展示名（优先使用二级菜单中的自定义显示名）
+        String mapName = mapData.getOrDefault("name", "???");
+        String mapDisplayName = mapData.getOrDefault("displayName", mapName);
+        String mapTitle = (!mapDisplayName.isEmpty() && !mapDisplayName.equals(mapName))
+                ? mapDisplayName : mapName;
+        String title = "§b§l排行榜 §7- §f" + mapTitle;
         if (title.length() > 128) title = title.substring(0, 128);
 
         Inventory inv = Bukkit.createInventory(

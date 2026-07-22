@@ -38,6 +38,7 @@ import org.bukkit.scoreboard.Objective;
 import org.bukkit.scoreboard.Scoreboard;
 import org.bukkit.scoreboard.ScoreboardManager;
 import org.bukkit.scoreboard.Team;
+import io.papermc.paper.scoreboard.numbers.NumberFormat;
 
 import club.sitmc.sitParkourLobby.data.MapStatus;
 import club.sitmc.sitParkourLobby.data.ParkourDataProvider;
@@ -376,9 +377,15 @@ public final class SITParkourLobby extends JavaPlugin implements CommandExecutor
                 return true;
             }
 
-            // 练习模式拦截
-            if (isInPracMode(player)) {
-                send(sender, "你正在练习模式中，无法打开菜单。");
+            // 练习模式 → 退出练习（与时钟一致，读值判断：1=prac）
+            Byte specialMode = player.getPersistentDataContainer()
+                    .get(new org.bukkit.NamespacedKey("sitsegment", "special_mode"),
+                            org.bukkit.persistence.PersistentDataType.BYTE);
+            if (specialMode != null && specialMode == 1) {
+                boolean success = player.performCommand("unprac");
+                if (!success) {
+                    send(sender, "无法执行退出练习命令，请确认 SITSegment 已安装。");
+                }
                 return true;
             }
 
@@ -810,6 +817,7 @@ public final class SITParkourLobby extends JavaPlugin implements CommandExecutor
         Objective objective = board.registerNewObjective("sitpk", "dummy",
                 ChatColor.translateAlternateColorCodes('&', SCOREBOARD_TITLE));
         objective.setDisplaySlot(DisplaySlot.SIDEBAR);
+        objective.numberFormat(NumberFormat.blank());
         objective.setDisplayName(ChatColor.translateAlternateColorCodes('&', SCOREBOARD_TITLE));
         playerBoards.put(player.getUniqueId(), board);
         player.setScoreboard(board);
@@ -836,6 +844,7 @@ public final class SITParkourLobby extends JavaPlugin implements CommandExecutor
                     ChatColor.translateAlternateColorCodes('&', SCOREBOARD_TITLE));
             objective.setDisplaySlot(DisplaySlot.SIDEBAR);
         }
+        objective.numberFormat(NumberFormat.blank());
         objective.setDisplayName(ChatColor.translateAlternateColorCodes('&', SCOREBOARD_TITLE));
 
         for (String entry : board.getEntries()) {
@@ -1041,6 +1050,18 @@ public final class SITParkourLobby extends JavaPlugin implements CommandExecutor
             meta.introduction = worldSec.getString("introduction");
             if (meta.introduction != null && meta.introduction.isEmpty()) meta.introduction = null;
 
+            // 固定槽位：非法值回退 -1
+            meta.fixedPage = worldSec.getInt("fixed-page", -1);
+            meta.fixedSlot = worldSec.getInt("fixed-slot", -1);
+            if (meta.fixedPage < 1 || meta.fixedSlot < 0 || meta.fixedSlot >= 45) {
+                if (meta.fixedPage >= 1 || meta.fixedSlot >= 0) {
+                    getLogger().warning("[WorldMeta] 世界 " + worldName + " 的 fixed-page/fixed-slot 非法"
+                            + " (page=" + meta.fixedPage + ", slot=" + meta.fixedSlot + ")，回退为未设置。");
+                }
+                meta.fixedPage = -1;
+                meta.fixedSlot = -1;
+            }
+
             worldMetaMap.put(worldName, meta);
             loaded++;
         }
@@ -1070,6 +1091,8 @@ public final class SITParkourLobby extends JavaPlugin implements CommandExecutor
             dataConfig.set(path + ".type-name", (meta.typeName != null && !meta.typeName.isEmpty()) ? meta.typeName : null);
             dataConfig.set(path + ".difficulty", (meta.difficulty != null && !meta.difficulty.isEmpty()) ? meta.difficulty : null);
             dataConfig.set(path + ".introduction", (meta.introduction != null && !meta.introduction.isEmpty()) ? meta.introduction : null);
+            dataConfig.set(path + ".fixed-page", meta.fixedPage >= 1 ? meta.fixedPage : null);
+            dataConfig.set(path + ".fixed-slot", meta.fixedSlot >= 0 && meta.fixedSlot < 45 ? meta.fixedSlot : null);
         }
     }
 
@@ -1201,8 +1224,10 @@ public final class SITParkourLobby extends JavaPlugin implements CommandExecutor
                 return handleWorldDifficulty(sender, args);
             case "intro":
                 return handleWorldIntro(sender, args);
+            case "slot":
+                return handleWorldSlot(sender, args);
             default:
-                send(sender, "未知子命令: " + sub + "。可用: import, add, remove, tp, list, category, timing, author, status, mapinfo, icon, displayname, typename, difficulty, intro");
+                send(sender, "未知子命令: " + sub + "。可用: import, add, remove, tp, list, category, timing, author, status, mapinfo, icon, displayname, typename, difficulty, intro, slot");
                 return true;
         }
     }
@@ -1628,6 +1653,12 @@ public final class SITParkourLobby extends JavaPlugin implements CommandExecutor
         send(sender, "&7类型展示名: " + (meta.typeName != null ? "&f" + meta.typeName : "&8(默认, 使用类型映射)"));
         send(sender, "&7难度: " + (meta.difficulty != null ? "&f" + meta.difficulty : "&8(未设置, 不显示)"));
         send(sender, "&7简介: " + (meta.introduction != null ? "&f" + meta.introduction : "&8(未设置, 不显示)"));
+        // 固定槽位
+        if (meta.fixedPage >= 1 && meta.fixedSlot >= 0 && meta.fixedSlot < 45) {
+            send(sender, "&7固定槽位: &fpage " + meta.fixedPage + " slot " + meta.fixedSlot);
+        } else {
+            send(sender, "&7固定槽位: &8(未设置)");
+        }
         return true;
     }
 
@@ -1856,6 +1887,104 @@ public final class SITParkourLobby extends JavaPlugin implements CommandExecutor
         return true;
     }
 
+    // ==================== /world slot ====================
+
+    private boolean handleWorldSlot(CommandSender sender, String[] args) {
+        if (args.length < 2) {
+            send(sender, "用法: /world slot <世界名> <页码> <slot号>  或  /world slot <世界名> reset");
+            return true;
+        }
+
+        String worldName = args[1];
+        if (!managedWorlds.contains(worldName)) {
+            send(sender, "该世界不在受管列表中: " + worldName);
+            return true;
+        }
+
+        // /world slot <世界名> reset/clear/- → 清除固定
+        if (args.length == 3 && (args[2].equalsIgnoreCase("reset")
+                || args[2].equalsIgnoreCase("clear") || args[2].equals("-"))) {
+            WorldMeta meta = worldMetaMap.get(worldName);
+            if (meta == null) {
+                send(sender, "世界 " + worldName + " 暂无元数据，无需清除固定槽位。");
+                return true;
+            }
+            meta.fixedPage = -1;
+            meta.fixedSlot = -1;
+            saveWorldMetadata();
+            dataProvider.setWorldMetadata(worldMetaMap);
+            send(sender, "世界 " + worldName + " 的固定槽位已清除，恢复自动排序。");
+            return true;
+        }
+
+        // /world slot <世界名> <页码> <slot号> → 设置固定
+        if (args.length != 4) {
+            send(sender, "用法: /world slot <世界名> <页码> <slot号>  或  /world slot <世界名> reset");
+            return true;
+        }
+
+        int page, slot;
+        try {
+            page = Integer.parseInt(args[2]);
+            slot = Integer.parseInt(args[3]);
+        } catch (NumberFormatException e) {
+            send(sender, "&c页码和 slot 号必须为整数。");
+            return true;
+        }
+
+        // 校验页码
+        if (page < 1) {
+            send(sender, "&c页码必须 ≥ 1。");
+            return true;
+        }
+
+        // 校验 slot 范围
+        if (slot < 0 || slot > 53) {
+            send(sender, "&cslot 号必须在 0~53 范围内。");
+            return true;
+        }
+
+        // 功能保留区拦截（slot 45~53 为导航/边框行）
+        if (slot >= 45) {
+            send(sender, "&c该位置为界面保留位（slot 45~53 为功能区: "
+                    + "45=返回按钮, 46=边框, 47=上一页, 48=边框, 49=下一页, 50~53=边框），不可放置地图。");
+            return true;
+        }
+
+        // 前置条件：必须先设玩法大类
+        WorldMeta meta = worldMetaMap.computeIfAbsent(worldName, k -> new WorldMeta());
+        ParkourGameType gameType = meta.category;
+        if (gameType == null) {
+            send(sender, "&c请先设置该世界的玩法大类: /world category " + worldName + " <PKW|SEGMENT|ONLYSPRINT|RANKUP>");
+            return true;
+        }
+
+        // 冲突检测：同玩法大类内，若已有其他地图占用了相同 page+slot，则清除旧地图的固定
+        for (Map.Entry<String, WorldMeta> entry : worldMetaMap.entrySet()) {
+            String otherName = entry.getKey();
+            WorldMeta otherMeta = entry.getValue();
+            if (otherName.equals(worldName)) continue; // 跳过自身
+            if (otherMeta.category != gameType) continue; // 不同玩法大类不冲突
+            if (otherMeta.fixedPage == page && otherMeta.fixedSlot == slot) {
+                // 冲突！清除旧地图的固定槽位
+                otherMeta.fixedPage = -1;
+                otherMeta.fixedSlot = -1;
+                String oldDisplay = (otherMeta.displayName != null && !otherMeta.displayName.isEmpty())
+                        ? otherMeta.displayName : otherName;
+                send(sender, "&e该位置原由 &b" + oldDisplay + " &e占用，&b"
+                        + oldDisplay + " &e已回退为自动排序。");
+                break; // 命令层已保证唯一，只应有一个冲突
+            }
+        }
+
+        meta.fixedPage = page;
+        meta.fixedSlot = slot;
+        saveWorldMetadata();
+        dataProvider.setWorldMetadata(worldMetaMap);
+        send(sender, "世界 " + worldName + " 已固定在第 &b" + page + " &f页的第 &b" + slot + " &f格。");
+        return true;
+    }
+
     // ==================== /world Tab 补全 ====================
 
     private List<String> tabCompleteWorld(CommandSender sender, String[] args) {
@@ -1868,7 +1997,8 @@ public final class SITParkourLobby extends JavaPlugin implements CommandExecutor
             String prefix = args[0].toLowerCase(Locale.ROOT);
             return List.of("import", "add", "remove", "tp", "list",
                     "category", "timing", "author", "status", "mapinfo",
-                    "icon", "displayname", "typename", "difficulty", "intro").stream()
+                    "icon", "displayname", "typename", "difficulty", "intro",
+                    "slot").stream()
                     .filter(sub -> sub.startsWith(prefix))
                     .toList();
         }
@@ -1900,6 +2030,7 @@ public final class SITParkourLobby extends JavaPlugin implements CommandExecutor
                 case "typename":
                 case "difficulty":
                 case "intro":
+                case "slot":
                     // 操作类/自定义字段命令：显示全部受管世界
                     return managedWorlds.stream()
                             .filter(name -> name.toLowerCase(Locale.ROOT).startsWith(prefix))
@@ -1991,6 +2122,13 @@ public final class SITParkourLobby extends JavaPlugin implements CommandExecutor
                             .map(s -> s.key)
                             .filter(key -> key.toLowerCase(Locale.ROOT).startsWith(prefix))
                             .toList();
+
+                case "slot":
+                    // /world slot <世界名> <页码|reset> — 提示 reset 关键字
+                    if ("reset".startsWith(prefix)) {
+                        return List.of("reset");
+                    }
+                    return List.of();
 
                 case "icon":
                     // /world icon <世界名> <材质名|reset>

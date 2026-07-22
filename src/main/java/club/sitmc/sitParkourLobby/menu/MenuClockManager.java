@@ -44,6 +44,11 @@ public class MenuClockManager implements Listener {
     static final int CLOCK_SLOT = 8;
 
     private static final NamespacedKey PDC_KEY = new NamespacedKey("sitparkourlobby", "menu_clock");
+
+    /** SITSegment 写入的 PDC 标记：special_mode=1 表示处于 prac/spec 特殊模式 */
+    private static final NamespacedKey SEGMENT_SPECIAL_MODE_KEY =
+            new NamespacedKey("sitsegment", "special_mode");
+
     private static final String CLOCK_DISPLAY_NAME = "§b跑酷菜单";
     private static final List<String> CLOCK_LORE = List.of("§7左键/右键 打开菜单");
 
@@ -253,6 +258,9 @@ public class MenuClockManager implements Listener {
     /**
      * 主手为菜单时钟时，左键或右键均打开菜单。
      *
+     * <p>若玩家处于 prac 状态（PDC special_mode=1），则改为执行 /unprac 退出练习，
+     * 不打开菜单界面。spec 状态玩家处于旁观模式无法交互物品，不会触发此事件。</p>
+     *
      * <p>左键攻击实体（LEFT_CLICK_ENTITY）走 {@code PlayerInteractEntityEvent}，
      * 不在本事件范围内，因此攻击生物不会误触发菜单。</p>
      */
@@ -267,7 +275,28 @@ public class MenuClockManager implements Listener {
         if (action == Action.RIGHT_CLICK_AIR || action == Action.RIGHT_CLICK_BLOCK
                 || action == Action.LEFT_CLICK_AIR || action == Action.LEFT_CLICK_BLOCK) {
             event.setCancelled(true);
-            openMenu(event.getPlayer());
+
+            Player player = event.getPlayer();
+
+            // 读取 SITSegment 写入的 PDC 标记：值为 1 表示处于 prac 特殊模式
+            // 注意：Segment 在非 prac 时也会保留此 key（值为 0），因此必须读值判断，
+            // 不能用 has()（has() 只要 key 存在就返回 true，无法区分 0/1）
+            Byte specialMode = player.getPersistentDataContainer()
+                    .get(SEGMENT_SPECIAL_MODE_KEY, PersistentDataType.BYTE);
+            if (specialMode != null && specialMode == 1) {
+                // 值=1 → 处于 prac 状态 → 退出练习，不打开菜单
+                boolean success = player.performCommand("unprac");
+                if (!success) {
+                    player.sendMessage(net.kyori.adventure.text.serializer.legacy.LegacyComponentSerializer
+                            .legacyAmpersand().deserialize(
+                                    "&3&lSIT-Parkour &8| &c无法执行退出练习命令，"
+                                    + "请确认 SITSegment 已安装。"));
+                }
+                return;
+            }
+
+            // 无标记或值≠1 → 不在 prac 状态 → 正常打开菜单
+            openMenu(player);
         }
     }
 

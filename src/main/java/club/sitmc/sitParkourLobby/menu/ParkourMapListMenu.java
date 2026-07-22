@@ -80,52 +80,193 @@ public class ParkourMapListMenu implements Listener {
 
     /**
      * 为指定玩家打开某玩法的地图列表二级 GUI。
+     *
+     * <p>排列逻辑：
+     * <ol>
+     *   <li>将地图拆分为固定地图（含 fixedPage/fixedSlot）和自动排序地图。</li>
+     *   <li>仅对自动地图按 {@link MapStatus#sort(List)} 排序（固定地图不参与）。</li>
+     *   <li>计算总页数 = max(1, 最大固定页码, 自动地图所需页码)。</li>
+     *   <li>调用 {@link #buildSlotMap(int, List, List)} 生成当前页的 slot→map 映射。</li>
+     * </ol>
      */
     public void openMapList(Player player, ParkourGameType gameType, int page) {
         List<Map<String, String>> rawMaps = new ArrayList<>(gameType.getMaps(dataProvider));
-        MapStatus.sort(rawMaps);
+
+        // 拆分为固定地图和自动排序地图
+        List<Map<String, String>> fixedMaps = new ArrayList<>();
+        List<Map<String, String>> autoMaps = new ArrayList<>();
+        for (Map<String, String> map : rawMaps) {
+            if (map.containsKey("fixedPage") && map.containsKey("fixedSlot")) {
+                fixedMaps.add(map);
+            } else {
+                autoMaps.add(map);
+            }
+        }
+
+        // 仅对自动排序地图执行原排序规则
+        MapStatus.sort(autoMaps);
 
         boolean isOp = player.isOp();
-        int totalPages = Math.max(1, (int) Math.ceil((double) rawMaps.size() / MAPS_PER_PAGE));
+
+        // 计算最大固定页码
+        int maxFixedPage = 0;
+        for (Map<String, String> fm : fixedMaps) {
+            try {
+                int fp = Integer.parseInt(fm.get("fixedPage"));
+                if (fp > maxFixedPage) maxFixedPage = fp;
+            } catch (NumberFormatException ignored) {
+            }
+        }
+
+        // 计算自动地图所需页数
+        int autoPageCount = countAutoPages(autoMaps, fixedMaps);
+        int totalPages = Math.max(1, Math.max(maxFixedPage, autoPageCount));
         if (page < 0) page = 0;
         if (page >= totalPages) page = totalPages - 1;
+
+        // 构建当前页的 slot→map 映射
+        Map<Integer, Map<String, String>> slotMap = buildSlotMap(page, fixedMaps, autoMaps);
 
         String title = gameType.coloredName + " §8- §7地图列表 §8(§f" + rawMaps.size() + "§8)";
         if (title.length() > 128) title = title.substring(0, 128);
 
         Inventory inv = Bukkit.createInventory(
-                new MapListHolder(gameType, page, rawMaps, isOp), MENU_SIZE, title);
+                new MapListHolder(gameType, page, slotMap, isOp, totalPages), MENU_SIZE, title);
 
-        renderPage(inv, page, rawMaps, isOp, totalPages);
+        renderPage(inv, page, slotMap, isOp, totalPages);
         player.openInventory(inv);
+    }
+
+    // ==================== 分页计算 ====================
+
+    /**
+     * 计算自动排序地图所需的页数。
+     *
+     * <p>模拟逐页填充：每页可用 content slot 数 = MAPS_PER_PAGE - 该页上的固定地图数。
+     * 持续直到所有自动地图都分配完毕。</p>
+     *
+     * @param autoMaps   自动排序的地图列表
+     * @param fixedMaps  固定地图列表
+     * @return 自动地图所需的总页数（可能为 0）
+     */
+    private int countAutoPages(List<Map<String, String>> autoMaps, List<Map<String, String>> fixedMaps) {
+        if (autoMaps.isEmpty()) return 0;
+        int remaining = autoMaps.size();
+        int page = 1; // 1-indexed
+        int safety = 0;
+        while (remaining > 0 && safety < 1000) {
+            int fixedOnThisPage = 0;
+            for (Map<String, String> fm : fixedMaps) {
+                try {
+                    if (Integer.parseInt(fm.get("fixedPage")) == page) {
+                        fixedOnThisPage++;
+                    }
+                } catch (NumberFormatException ignored) {
+                }
+            }
+            int slotsForAuto = MAPS_PER_PAGE - fixedOnThisPage;
+            if (slotsForAuto > 0) {
+                remaining -= slotsForAuto;
+            }
+            page++;
+            safety++;
+        }
+        return page - 1; // page 在最后处理后自增，减回即为最后一页
+    }
+
+    // ==================== Slot 映射构建 ====================
+
+    /**
+     * 构建当前页的 slot → map 映射。
+     *
+     * <h3>两步放置</h3>
+     * <ol>
+     *   <li><b>固定地图先落位</b>：遍历 fixedMaps，把 fixedPage 匹配当前页的地图
+     *       放入其 fixedSlot。防御性检测：同 slot 已有地图时保留第一个，记录警告。</li>
+     *   <li><b>自动地图填空</b>：计算前面各页已消耗的自动地图数（每页 MAPS_PER_PAGE - fixedCount），
+     *       得到本页的起始偏移量，然后按 slot 0→44 顺序填入未占用的空位。</li>
+     * </ol>
+     *
+     * @param page       当前页（0-indexed）
+     * @param fixedMaps  所有固定地图
+     * @param autoMaps   所有自动排序地图（已按状态+名称排序）
+     * @return slot → map data 的映射（仅包含有地图的槽位）
+     */
+    private Map<Integer, Map<String, String>> buildSlotMap(int page,
+                                                           List<Map<String, String>> fixedMaps,
+                                                           List<Map<String, String>> autoMaps) {
+        Map<Integer, Map<String, String>> slotMap = new LinkedHashMap<>();
+        int currentPage = page + 1; // 转为 1-indexed
+
+        // Step 1：放置固定地图
+        for (Map<String, String> fm : fixedMaps) {
+            try {
+                int fPage = Integer.parseInt(fm.get("fixedPage"));
+                int fSlot = Integer.parseInt(fm.get("fixedSlot"));
+                if (fPage == currentPage) {
+                    if (slotMap.containsKey(fSlot)) {
+                        // 防御：渲染时不应出现冲突（命令层已解决），记录警告
+                        String existingName = slotMap.get(fSlot).getOrDefault("name", "???");
+                        String newName = fm.getOrDefault("name", "???");
+                        System.err.println("[ParkourMapListMenu] 警告: 固定槽位冲突 page="
+                                + fPage + " slot=" + fSlot + " 原=" + existingName + " 新=" + newName);
+                    } else {
+                        slotMap.put(fSlot, fm);
+                    }
+                }
+            } catch (NumberFormatException ignored) {
+            }
+        }
+
+        // Step 2：计算自动地图的起始偏移量
+        int autoIndex = 0;
+        for (int pg = 1; pg < currentPage; pg++) {
+            int fixedOnPg = 0;
+            for (Map<String, String> fm : fixedMaps) {
+                try {
+                    if (Integer.parseInt(fm.get("fixedPage")) == pg) {
+                        fixedOnPg++;
+                    }
+                } catch (NumberFormatException ignored) {
+                }
+            }
+            autoIndex += MAPS_PER_PAGE - fixedOnPg;
+        }
+
+        // Step 3：填入自动地图（按 slot 顺序填空位）
+        for (int slot = 0; slot < MAPS_PER_PAGE; slot++) {
+            if (slotMap.containsKey(slot)) continue; // 已被固定地图占用
+            if (autoIndex >= 0 && autoIndex < autoMaps.size()) {
+                slotMap.put(slot, autoMaps.get(autoIndex));
+                autoIndex++;
+            }
+        }
+
+        return slotMap;
     }
 
     // ==================== 页面渲染 ====================
 
-    private void renderPage(Inventory inv, int page, List<Map<String, String>> maps,
+    /**
+     * 渲染当前页：全边框 → 放置 slotMap 中的地图 → 导航按钮。
+     */
+    private void renderPage(Inventory inv, int page, Map<Integer, Map<String, String>> slotMap,
                             boolean isOp, int totalPages) {
         // 先全边框
         ParkourMenu.fillBorder(inv);
 
-        int start = page * MAPS_PER_PAGE;
-        int end = Math.min(start + MAPS_PER_PAGE, maps.size());
-
-        // 地图项（slots 0-44）
-        for (int i = start; i < end; i++) {
-            int slot = i - start;
-            inv.setItem(slot, createMapIcon(maps.get(i), isOp));
+        // 地图项（按 slotMap 放置，可能不连续）
+        for (Map.Entry<Integer, Map<String, String>> entry : slotMap.entrySet()) {
+            inv.setItem(entry.getKey(), createMapIcon(entry.getValue(), isOp));
         }
 
         // 导航行（覆盖 row 5 边框）
-        // 返回按钮 — 左下角
         inv.setItem(SLOT_BACK, backButton());
 
-        // 上一页
         if (page > 0) {
             inv.setItem(SLOT_PREV, prevButton(page, totalPages));
         }
 
-        // 下一页
         if (page < totalPages - 1) {
             inv.setItem(SLOT_NEXT, nextButton(page, totalPages));
         }
@@ -198,7 +339,7 @@ public class ParkourMapListMenu implements Listener {
             if (!introduction.isEmpty()) {
                 lore.add(""); // 空行间隔
                 String introText = introduction.startsWith("§") ? introduction : "§7" + introduction;
-                lore.addAll(ParkourMenu.wrapText(introText, 12));
+                lore.addAll(ParkourMenu.wrapText(introText, 24));
             }
         }
 
@@ -307,9 +448,9 @@ public class ParkourMapListMenu implements Listener {
 
         // 地图项点击
         if (slot < MAPS_PER_PAGE) {
-            int mapIndex = holder.page * MAPS_PER_PAGE + slot;
-            if (mapIndex < holder.sortedMaps.size()) {
-                handleMapClick(player, holder.sortedMaps.get(mapIndex), holder.isOp, holder.gameType);
+            Map<String, String> map = holder.slotMap.get(slot);
+            if (map != null) {
+                handleMapClick(player, map, holder.isOp, holder.gameType);
             }
         }
     }
@@ -357,18 +498,22 @@ public class ParkourMapListMenu implements Listener {
     static class MapListHolder implements InventoryHolder {
         final ParkourGameType gameType;
         final int page;
-        final List<Map<String, String>> sortedMaps;
+        /** slot → map data（仅当前页，含固定地图和自动地图） */
+        final Map<Integer, Map<String, String>> slotMap;
         final boolean isOp;
+        final int totalPages;
 
-        MapListHolder(ParkourGameType gameType, int page, List<Map<String, String>> sortedMaps, boolean isOp) {
+        MapListHolder(ParkourGameType gameType, int page,
+                      Map<Integer, Map<String, String>> slotMap, boolean isOp, int totalPages) {
             this.gameType = gameType;
             this.page = page;
-            this.sortedMaps = sortedMaps;
+            this.slotMap = slotMap;
             this.isOp = isOp;
+            this.totalPages = totalPages;
         }
 
         int totalPages() {
-            return Math.max(1, (int) Math.ceil((double) sortedMaps.size() / MAPS_PER_PAGE));
+            return totalPages;
         }
 
         @Override
