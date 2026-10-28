@@ -1,0 +1,57 @@
+﻿name: SITParkourLobby
+version: '1.0'
+main: club.sitmc.sitParkourLobby.SITParkourLobby
+api-version: '1.21'
+prefix: SITMCPK
+load: STARTUP
+authors: [ 上应天子Minecraft社 ]
+description: SIT 跑酷大厅
+website: www.sitmc.club
+softdepend: [SITParkourWarrior, SITSegment]
+commands:
+  lobby:
+    description: 传送到大厅世界出生点。
+    usage: /lobby
+  hub:
+    description: 传送到大厅世界出生点。
+    usage: /hub
+  spawn:
+    description: 传送到大厅世界出生点。
+    usage: /spawn
+  map:
+    description: 传送到指定世界出生点。
+    usage: /map <世界名>
+  addmap:
+    description: 添加可用的 /map 世界。
+    usage: /addmap <世界名>
+  delmap:
+    description: 从 /map 列表移除世界。
+    usage: /delmap <世界名>
+  listmap:
+    description: 查看可用的 /map 世界列表。
+    usage: /listmap
+  create:
+    description: 创建一个虚空世界。
+    usage: /create <世界名>
+  falldamage:
+    description: 切换当前世界摔落伤害。
+    usage: /falldamage [on|off|toggle]
+  world:
+    description: 世界管理命令（导入/添加/移除/传送/列表/元数据编辑）。
+    usage: /world <import|add|remove|tp|list|category|timing|author|status|mapinfo> [参数...]
+  menu:
+    description: 打开跑酷菜单。
+    usage: /menu
+permissions:
+  sitpk.create:
+    description: 允许创建虚空世界。
+    default: op
+  sitpk.falldamage:
+    description: 允许切换摔落伤害。
+    default: op
+  sitpk.addmap:
+    description: 允许添加 /map 可用世界并查看全部世界。
+    default: op
+  sitpk.world:
+    description: 允许使用 /world 世界管理命令。
+    default: op
