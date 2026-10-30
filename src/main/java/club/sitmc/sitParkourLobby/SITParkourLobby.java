@@ -46,6 +46,7 @@ import club.sitmc.sitParkourLobby.data.ParkourGameType;
 import club.sitmc.sitParkourLobby.data.SkinCacheManager;
 import club.sitmc.sitParkourLobby.data.TimingMode;
 import club.sitmc.sitParkourLobby.data.WorldMeta;
+import club.sitmc.sitParkourLobby.event.DecorationProtectionListener;
 import club.sitmc.sitParkourLobby.event.ManagedWorldsLoadedEvent;
 import club.sitmc.sitParkourLobby.inventory.InventoryListener;
 import club.sitmc.sitParkourLobby.inventory.InventoryManager;
@@ -144,6 +145,8 @@ public final class SITParkourLobby extends JavaPlugin implements CommandExecutor
         }
 
         Bukkit.getPluginManager().registerEvents(this, this);
+        Bukkit.getPluginManager().registerEvents(
+                new DecorationProtectionListener(managedWorlds), this);
 
         // 按世界独立背包
         inventoryManager = new InventoryManager(getDataFolder(), getLogger());
@@ -160,7 +163,7 @@ public final class SITParkourLobby extends JavaPlugin implements CommandExecutor
         LeaderboardMenu leaderboardMenu = new LeaderboardMenu(dataProvider, skinCacheManager, getLogger());
         MapDetailMenu mapDetailMenu = new MapDetailMenu(dataProvider);
         ParkourMapListMenu mapListMenu = new ParkourMapListMenu(dataProvider);
-        parkourMenu = new ParkourMenu(dataProvider);
+        parkourMenu = new ParkourMenu(dataProvider, this);
 
         // 注入引用链（解决循环依赖）
         parkourMenu.setStatsProvider(uuid -> {

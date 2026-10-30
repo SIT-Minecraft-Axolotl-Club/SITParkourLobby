@@ -1,0 +1,22 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(Get-ChildItem -Recurse -Name -Depth 4 \"D:\\\\IntelliJ IDEA\\\\projects\\\\SITParkourLobby-master\")",
+      "Bash(Select-Object -First 200)",
+      "Bash(Get-ChildItem *)",
+      "Bash(Remove-Item *)",
+      "WebSearch",
+      "mcp__ide__getDiagnostics",
+      "Bash(.\\\\gradlew.bat build *)",
+      "Bash(curl -sL -o gradle/wrapper/gradle-wrapper.jar \"https://raw.githubusercontent.com/gradle/gradle/v9.6.1/gradle/wrapper/gradle-wrapper.jar\")",
+      "Bash(git checkout *)",
+      "Bash(./gradlew build *)",
+      "Bash(./gradlew compileJava)",
+      "Bash(./gradlew dependencies *)",
+      "Bash(jar tf *)",
+      "Bash(jar xf *)",
+      "Bash(javap -p org/bukkit/Material.class)",
+      "Bash(mvn compile *)"
+    ]
+  }
+}

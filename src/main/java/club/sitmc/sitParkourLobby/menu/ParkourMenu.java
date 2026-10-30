@@ -2,22 +2,37 @@ package club.sitmc.sitParkourLobby.menu;
 
 import club.sitmc.sitParkourLobby.data.ParkourDataProvider;
 import club.sitmc.sitParkourLobby.data.ParkourGameType;
+import io.papermc.paper.event.player.AsyncChatEvent;
+import io.papermc.paper.dialog.Dialog;
+import io.papermc.paper.registry.data.dialog.ActionButton;
+import io.papermc.paper.registry.data.dialog.DialogBase;
+import io.papermc.paper.registry.data.dialog.action.DialogAction;
+import io.papermc.paper.registry.data.dialog.type.DialogType;
 import net.kyori.adventure.text.Component;
+import net.kyori.adventure.text.event.ClickEvent;
 import net.kyori.adventure.text.format.TextDecoration;
 import net.kyori.adventure.text.serializer.legacy.LegacyComponentSerializer;
+import net.kyori.adventure.text.serializer.plain.PlainTextComponentSerializer;
 import org.bukkit.Bukkit;
 import org.bukkit.Material;
 import org.bukkit.entity.Player;
 import org.bukkit.event.EventHandler;
 import org.bukkit.event.Listener;
 import org.bukkit.event.inventory.InventoryClickEvent;
+import org.bukkit.event.player.PlayerQuitEvent;
+import org.bukkit.configuration.file.YamlConfiguration;
 import org.bukkit.inventory.Inventory;
 import org.bukkit.inventory.InventoryHolder;
 import org.bukkit.inventory.ItemStack;
 import org.bukkit.inventory.meta.ItemMeta;
 import org.bukkit.inventory.meta.SkullMeta;
+import org.bukkit.plugin.java.JavaPlugin;
 import org.jetbrains.annotations.NotNull;
 
+import java.io.File;
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.StandardCopyOption;
 import java.text.DecimalFormat;
 import java.text.DecimalFormatSymbols;
 import java.util.ArrayList;
@@ -25,8 +40,11 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.Function;
+import java.util.logging.Level;
 
 /**
  * 跑酷菜单（一级界面 — 玩法选择）。
@@ -34,8 +52,8 @@ import java.util.function.Function;
  * <h3>界面布局（27 格 chest）</h3>
  * <pre>
  *  Row 0 (slots  0- 8): [B][B][B][B][B][B][B][B][B]  全边框
- *  Row 1 (slots  9-17): [B][RKU][ ][SEG][ ][SPR][  ][PKW][B]  RKU(10)/SEG(12)/SPR(14)/PKW(16)
- *  Row 2 (slots 18-26): [B][  ][  ][  ][头][  ][  ][  ][B]  玩家信息(22)
+ *  Row 1 (slots  9-17): [B][PKW][ ][SEG][ ][RKU][ ][SPR][B]  PKW(10)/SEG(12)/RKU(14)/SPR(16)
+ *  Row 2 (slots 18-26): [B][日志][  ][  ][头][  ][  ][练习][B]  日志(20)/玩家信息(22)/练习(24)
  * </pre>
  *
  * <p>点击玩法图标 → 打开对应的二级地图列表 GUI。</p>
@@ -43,13 +61,17 @@ import java.util.function.Function;
 public class ParkourMenu implements Listener {
 
     private static final String MENU_TITLE = "§b§l跑酷菜单";
+    private static final String LOBBY_LOG_URL = "https://sit-minecraft.feishu.cn/wiki/Je7bwXTrEipna7kyKdUcQq6ZnKh";
+    private static final String LOBBY_LOG_PERMISSION = "sitpk.world";
+    private static final String LOBBY_LOG_FILE = "lobby-log.yml";
     private static final int MENU_SIZE = 27;
 
     // 一级界面槽位（4 个玩法图标，均匀分布在 row 1 中）
-    private static final int SLOT_RANKUP = 12;
-    private static final int SLOT_SEGMENT = 10;
-    private static final int SLOT_ONLYSPRINT = 14;
-    private static final int SLOT_PKW = 16;
+    private static final int SLOT_PKW = 10;
+    private static final int SLOT_SEGMENT = 12;
+    private static final int SLOT_RANKUP = 14;
+    private static final int SLOT_ONLYSPRINT = 16;
+    private static final int SLOT_LOBBY_LOG = 20;
     private static final int SLOT_PLAYER_INFO = 22;
     /** 练习模式入口图标 — 玩家信息后第 2 格（slot 24） */
     private static final int SLOT_PRACTICE = 24;
@@ -70,6 +92,12 @@ public class ParkourMenu implements Listener {
     }
 
     private final ParkourDataProvider dataProvider;
+    private final JavaPlugin plugin;
+    private final File lobbyLogFile;
+    private final Object lobbyLogFileLock = new Object();
+    private final Set<UUID> pendingLogEditors = ConcurrentHashMap.newKeySet();
+    private volatile long lobbyLogSaveRevision;
+    private String lobbyLog = "";
 
     // ==================== 颜色渲染工具（Paper 1.21.10 Component API） ====================
 
@@ -199,8 +227,11 @@ public class ParkourMenu implements Listener {
     private final DecimalFormat hoursFormat = new DecimalFormat("0.0",
             DecimalFormatSymbols.getInstance(Locale.US));
 
-    public ParkourMenu(ParkourDataProvider dataProvider) {
+    public ParkourMenu(ParkourDataProvider dataProvider, JavaPlugin plugin) {
         this.dataProvider = dataProvider;
+        this.plugin = plugin;
+        this.lobbyLogFile = new File(plugin.getDataFolder(), LOBBY_LOG_FILE);
+        loadLobbyLog();
     }
 
     /** 注入二级菜单引用（解决循环依赖）。 */
@@ -285,6 +316,9 @@ public class ParkourMenu implements Listener {
         ));
 
         inv.setItem(SLOT_PLAYER_INFO, createPlayerInfoIcon(player));
+
+        // 跑酷服指南入口（左键发送链接，管理员右键编辑）
+        inv.setItem(SLOT_LOBBY_LOG, createLobbyLogIcon());
 
         // 练习模式入口（绿宝石图标，玩家信息后第 2 格）
         inv.setItem(SLOT_PRACTICE, createPracticeIcon());
@@ -400,6 +434,101 @@ public class ParkourMenu implements Listener {
         return item;
     }
 
+    /** 创建跑酷服指南图标并展示已保存的日志正文。 */
+    private ItemStack createLobbyLogIcon() {
+        ItemStack item = new ItemStack(Material.BOOK);
+        ItemMeta meta = item.getItemMeta();
+        meta.displayName(colorize("§e跑酷服指南🔗"));
+
+        List<String> lore = new ArrayList<>();
+        lore.add("§7§m--------------------");
+        if (lobbyLog == null || lobbyLog.isBlank()) {
+            lore.add("§7暂无日志");
+        } else {
+            lore.addAll(wrapText(lobbyLog, 35));
+        }
+        meta.lore(colorizeList(lore));
+        item.setItemMeta(meta);
+        return item;
+    }
+
+    private void loadLobbyLog() {
+        if (!lobbyLogFile.isFile()) {
+            lobbyLog = "";
+            return;
+        }
+
+        try {
+            lobbyLog = YamlConfiguration.loadConfiguration(lobbyLogFile).getString("text", "");
+        } catch (RuntimeException exception) {
+            lobbyLog = "";
+            plugin.getLogger().log(Level.WARNING, "无法读取大厅日志，暂按空日志处理。", exception);
+        }
+    }
+
+    private void beginLobbyLogEdit(Player player) {
+        if (!player.hasPermission(LOBBY_LOG_PERMISSION)) {
+            return;
+        }
+
+        pendingLogEditors.add(player.getUniqueId());
+        player.closeInventory();
+        player.sendMessage(colorize("§e请在聊天中输入新的大厅日志内容。"));
+    }
+
+    private void saveLobbyLog(String text, UUID editorId) {
+        lobbyLog = text;
+        long revision = ++lobbyLogSaveRevision;
+
+        Bukkit.getScheduler().runTaskAsynchronously(plugin, () -> {
+            boolean saved = false;
+            synchronized (lobbyLogFileLock) {
+                if (revision != lobbyLogSaveRevision) {
+                    return;
+                }
+                try {
+                    saveLobbyLogFile(text);
+                    saved = true;
+                } catch (IOException | RuntimeException exception) {
+                    plugin.getLogger().log(Level.SEVERE, "大厅日志保存失败。", exception);
+                }
+            }
+
+            boolean saveSucceeded = saved;
+            try {
+                Bukkit.getScheduler().runTask(plugin, () -> {
+                    if (revision != lobbyLogSaveRevision) {
+                        return;
+                    }
+                    Player editor = Bukkit.getPlayer(editorId);
+                    if (editor != null) {
+                        String message = saveSucceeded
+                                ? "§a大厅日志已保存。"
+                                : "§c大厅日志保存失败，请稍后重试。";
+                        editor.sendMessage(colorize(message));
+                    }
+                });
+            } catch (RuntimeException ignored) {
+                // 插件停用期间不再向玩家发送异步保存结果。
+            }
+        });
+    }
+
+    private void saveLobbyLogFile(String text) throws IOException {
+        File dataFolder = plugin.getDataFolder();
+        if (!dataFolder.isDirectory() && !dataFolder.mkdirs()) {
+            throw new IOException("无法创建插件数据目录: " + dataFolder.getAbsolutePath());
+        }
+
+        File temporaryFile = new File(dataFolder, LOBBY_LOG_FILE + ".tmp");
+        YamlConfiguration configuration = new YamlConfiguration();
+        configuration.set("text", text);
+        configuration.save(temporaryFile);
+
+        Files.move(temporaryFile.toPath(), lobbyLogFile.toPath(),
+                StandardCopyOption.REPLACE_EXISTING);
+    }
+
     // ==================== 边框 ====================
 
     /**
@@ -443,6 +572,19 @@ public class ParkourMenu implements Listener {
             return;
         }
 
+        if (slot == SLOT_LOBBY_LOG) {
+            if (event.isRightClick()) {
+                beginLobbyLogEdit(player);
+            } else if (event.isLeftClick()) {
+                player.showDialog(Dialog.create(builder -> builder.empty()
+                        .base(DialogBase.builder(Component.text("跑酷服指南🔗")).build())
+                        .type(DialogType.notice(ActionButton.builder(Component.text("打开指南"))
+                                .action(DialogAction.staticAction(ClickEvent.openUrl(LOBBY_LOG_URL)))
+                                .build()))));
+            }
+            return;
+        }
+
         if (mapListMenu == null) return;
 
         switch (slot) {
@@ -461,6 +603,29 @@ public class ParkourMenu implements Listener {
             }
             // SLOT_PLAYER_INFO — 暂不处理（占位）
         }
+    }
+
+    @EventHandler
+    public void onLogEditorChat(AsyncChatEvent event) {
+        UUID editorId = event.getPlayer().getUniqueId();
+        if (!pendingLogEditors.remove(editorId)) {
+            return;
+        }
+
+        event.setCancelled(true);
+        String text = PlainTextComponentSerializer.plainText().serialize(event.message());
+        Bukkit.getScheduler().runTask(plugin, () -> {
+            Player editor = Bukkit.getPlayer(editorId);
+            if (editor == null || !editor.hasPermission(LOBBY_LOG_PERMISSION)) {
+                return;
+            }
+            saveLobbyLog(text, editorId);
+        });
+    }
+
+    @EventHandler
+    public void onLogEditorQuit(PlayerQuitEvent event) {
+        pendingLogEditors.remove(event.getPlayer().getUniqueId());
     }
 
     // ==================== 中文显示映射 ====================
